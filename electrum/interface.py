@@ -96,6 +96,15 @@ class NetworkTimeout:
         MOST_RELAXED = 60
 
 
+# Liveness ping: interval between pings, and the timeout for each ping response.
+# The timeout is deliberately short and independent of NetworkTimeout/get_network_timeout_seconds()
+# (which can be up to 600s for oneserver+manual setups) -- a keepalive ping must stay fast so a
+# silently-dead connection (e.g. after the host resumes from suspend, or a Wi-Fi/VPN drop) is
+# noticed quickly, regardless of how generous the timeout for legitimate slow requests is configured.
+PING_INTERVAL_SECONDS_RANGE = (45, 90)
+PING_TIMEOUT_SECONDS = 20
+
+
 def assert_non_negative_integer(val: Any) -> None:
     if not is_non_negative_integer(val):
         raise RequestCorrupted(f'{val!r} should be a non-negative integer')
@@ -1054,12 +1063,16 @@ class Interface(Logger):
                 raise GracefulDisconnect('session was closed')
 
     async def ping(self):
-        # We periodically send a "ping" msg to make sure the server knows we are still here.
-        # Adding a bit of randomness generates some noise against traffic analysis.
+        # We periodically send a "ping" msg to make sure the server knows we are still here,
+        # and, symmetrically, to make sure we notice promptly if the server (or the connection
+        # to it) is gone. Adding a bit of randomness generates some noise against traffic analysis.
         while True:
-            await asyncio.sleep(random.random() * 300)
-            await self.session.send_request('server.ping')
-            await self._maybe_send_noise()
+            await asyncio.sleep(random.uniform(*PING_INTERVAL_SECONDS_RANGE))
+            await self._do_one_ping()
+
+    async def _do_one_ping(self):
+        await self.session.send_request('server.ping', timeout=PING_TIMEOUT_SECONDS)
+        await self._maybe_send_noise()
 
     async def _maybe_send_noise(self):
         while random.random() < 0.2:

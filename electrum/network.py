@@ -77,6 +77,11 @@ NUM_TARGET_CONNECTED_SERVERS = 10
 NUM_STICKY_SERVERS = 4
 NUM_RECENT_SERVERS = 20
 
+# Backoff for _maintain_sessions_iteration() after a caught exception, so a persistently
+# failing iteration logs-and-retries on an increasing delay instead of hot-looping every 0.1s.
+MAINTAIN_SESSIONS_ITERATION_BASE_DELAY = 0.1
+MAINTAIN_SESSIONS_ITERATION_MAX_DELAY = 30
+
 T = TypeVar('T')
 
 
@@ -392,6 +397,9 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
         self._connecting_ifaces = set()
         self.interfaces = {}  # these are the ifaces in "initialised and usable" state
         self._closing_ifaces = set()
+
+        # consecutive exceptions caught by _maintain_sessions_iteration(); drives its backoff
+        self._maintain_sessions_consecutive_failures = 0
 
         # Dump network messages (all interfaces).  Set at runtime from the console.
         self.debug = False
@@ -1270,6 +1278,24 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
         if not full_shutdown:
             util.trigger_callback('network_updated')
 
+    @log_exceptions
+    async def restart(self) -> None:
+        """Force a full teardown and rebuild of all interfaces.
+
+        Reuses the same stop/start pair set_parameters() already relies on for
+        proxy/oneserver changes (see above). Exposed as a public method so it can be
+        triggered manually (e.g. a "Retry" button in the GUI).
+
+        Note: _start() calls _clear_addr_retry_times(), which wipes NetworkRetryManager's
+        per-server backoff state entirely. That is intentional for an explicit, user-initiated
+        retry, but it means this method must NOT be wired into any automatic/periodic recovery
+        path -- doing so would repeatedly erase backoff history and defeat the exponential
+        backoff NetworkRetryManager exists to enforce, effectively hammering servers.
+        """
+        async with self.restart_lock:
+            await self.stop(full_shutdown=False)
+            await self._start()
+
     async def _ensure_there_is_a_main_interface(self):
         if self.interface:
             return
@@ -1281,34 +1307,58 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
             if self._can_retry_addr(self.default_server, urgent=True):
                 await self.switch_to_interface(self.default_server)
 
-    async def _maintain_sessions(self):
-        async def maybe_start_new_interfaces():
-            num_existing_ifaces = len(self.interfaces) + len(self._connecting_ifaces) + len(self._closing_ifaces)
-            for i in range(self.num_server - num_existing_ifaces):
-                # FIXME this should try to honour "healthy spread of connected servers"
-                server = self._get_next_server_to_try()
-                if server:
-                    assert isinstance(server, ServerAddr), f"expected ServerAddr, got {type(server)}"
-                    await self.taskgroup.spawn(self._run_new_interface(server))
-        async def maintain_healthy_spread_of_connected_servers():
-            with self.interfaces_lock: interfaces = list(self.interfaces.values())
-            random.shuffle(interfaces)
-            for iface in interfaces:
-                if not self.check_interface_against_healthy_spread_of_connected_servers(iface):
-                    self.logger.info(f"disconnecting from {iface.server}. too many connected "
-                                     f"servers already in bucket {iface.bucket_based_on_ipaddress()}")
-                    await self._close_interface(iface)
-        async def maintain_main_interface():
-            await self._ensure_there_is_a_main_interface()
-            if self.is_connected():
-                if self.is_fee_estimates_update_required():
-                    await self.interface.taskgroup.spawn(self._request_fee_estimates, self.interface)
+    async def _maybe_start_new_interfaces(self):
+        num_existing_ifaces = len(self.interfaces) + len(self._connecting_ifaces) + len(self._closing_ifaces)
+        for i in range(self.num_server - num_existing_ifaces):
+            # FIXME this should try to honour "healthy spread of connected servers"
+            server = self._get_next_server_to_try()
+            if server:
+                assert isinstance(server, ServerAddr), f"expected ServerAddr, got {type(server)}"
+                await self.taskgroup.spawn(self._run_new_interface(server))
 
+    async def _maintain_healthy_spread_of_connected_servers(self):
+        with self.interfaces_lock: interfaces = list(self.interfaces.values())
+        random.shuffle(interfaces)
+        for iface in interfaces:
+            if not self.check_interface_against_healthy_spread_of_connected_servers(iface):
+                self.logger.info(f"disconnecting from {iface.server}. too many connected "
+                                 f"servers already in bucket {iface.bucket_based_on_ipaddress()}")
+                await self._close_interface(iface)
+
+    async def _maintain_main_interface(self):
+        await self._ensure_there_is_a_main_interface()
+        if self.is_connected():
+            if self.is_fee_estimates_update_required():
+                await self.interface.taskgroup.spawn(self._request_fee_estimates, self.interface)
+
+    async def _maintain_sessions_iteration(self) -> float:
+        """Runs one iteration of the _maintain_sessions() loop, and returns how long the
+        loop should sleep before the next one."""
+        try:
+            await self._maybe_start_new_interfaces()
+            await self._maintain_healthy_spread_of_connected_servers()
+            await self._maintain_main_interface()
+        except Exception:
+            # note: CancelledError is a BaseException (not Exception) since py3.8,
+            # so normal task-group cancellation still propagates through here.
+            # Without this guard, a single bad iteration would kill this task, which
+            # in turn kills the whole Network.taskgroup, and nothing ever reconnects
+            # again until the app is restarted.
+            self.logger.exception("error in _maintain_sessions; will retry")
+            self._maintain_sessions_consecutive_failures += 1
+            # exponential backoff: a persistently failing iteration (e.g. a real bug in one
+            # of the steps above) should not hot-loop logging a full traceback every 0.1s.
+            return min(
+                MAINTAIN_SESSIONS_ITERATION_MAX_DELAY,
+                MAINTAIN_SESSIONS_ITERATION_BASE_DELAY * 2 ** self._maintain_sessions_consecutive_failures,
+            )
+        self._maintain_sessions_consecutive_failures = 0
+        return MAINTAIN_SESSIONS_ITERATION_BASE_DELAY
+
+    async def _maintain_sessions(self):
         while True:
-            await maybe_start_new_interfaces()
-            await maintain_healthy_spread_of_connected_servers()
-            await maintain_main_interface()
-            await asyncio.sleep(0.1)
+            delay = await self._maintain_sessions_iteration()
+            await asyncio.sleep(delay)
 
     @classmethod
     async def async_send_http_on_proxy(

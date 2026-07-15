@@ -1,13 +1,17 @@
 import asyncio
 import tempfile
+import threading
 import unittest
 from typing import List
+from unittest.mock import AsyncMock
 
 from electrum import constants
 from electrum.simple_config import SimpleConfig
 from electrum import blockchain
-from electrum.interface import Interface, ServerAddr, ChainResolutionMode
+from electrum.interface import Interface, ServerAddr, ChainResolutionMode, GracefulDisconnect, PING_TIMEOUT_SECONDS
 from electrum.crypto import sha256
+from electrum.logging import Logger
+from electrum.network import Network, MAINTAIN_SESSIONS_ITERATION_BASE_DELAY, MAINTAIN_SESSIONS_ITERATION_MAX_DELAY
 from electrum.util import OldTaskGroup
 from electrum import util
 
@@ -262,6 +266,82 @@ class TestHeaderChainResolution(ElectrumTestCase):
         self.assertEqual((CRM.CATCHUP, 14), res)
         self.assertEqual(ifa.q.qsize(), 0)
         self.assertEqual(len(blockchain.blockchains), 2)
+
+
+class TestInterfacePing(ElectrumTestCase):
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.config = SimpleConfig({'electrum_path': self.electrum_path})
+        self.interface = MockInterface(self.config)
+        self.interface.session = AsyncMock()
+        # _maybe_send_noise() randomly injects extra decoy 'server.ping' calls (against
+        # traffic analysis); stub it out so these tests deterministically only see the
+        # single, real liveness-check call made by _do_one_ping() itself.
+        self.interface._maybe_send_noise = AsyncMock()
+
+    async def test_do_one_ping_uses_short_dedicated_timeout(self):
+        """_do_one_ping must pass an explicit, short timeout to send_request, instead of
+        relying on the session's own default (which can be up to 600s for oneserver
+        setups, see Network.get_network_timeout_seconds) -- otherwise a dead connection
+        could go undetected for minutes."""
+        await self.interface._do_one_ping()
+        self.interface.session.send_request.assert_awaited_once_with('server.ping', timeout=PING_TIMEOUT_SECONDS)
+
+    async def test_do_one_ping_propagates_disconnect(self):
+        """If the ping fails/times out, that failure must propagate out of _do_one_ping
+        (as a GracefulDisconnect), so the existing handle_disconnect/connection_down
+        reconnection path gets triggered."""
+        self.interface.session.send_request.side_effect = GracefulDisconnect('simulated timeout')
+        with self.assertRaises(GracefulDisconnect):
+            await self.interface._do_one_ping()
+
+
+class TestMaintainSessionsHardening(ElectrumTestCase):
+    """Network._maintain_sessions_iteration() must never let an exception from one of its
+    three maintenance steps escape -- otherwise it kills the whole Network.taskgroup and
+    the app stops trying to reconnect until it is restarted (see electrum/network.py)."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        # Build a bare, minimally-initialized Network instance: bypass __init__ (it asserts
+        # a global singleton and needs a fully configured event loop/blockchain files),
+        # and only set the handful of attributes the un-mocked maintenance steps touch.
+        self.network = Network.__new__(Network)
+        Logger.__init__(self.network)
+        self.network.interfaces = {}
+        self.network._connecting_ifaces = set()
+        self.network._closing_ifaces = set()
+        self.network.num_server = 0  # -> _maybe_start_new_interfaces() is a no-op
+        self.network.interfaces_lock = threading.Lock()
+        self.network._maintain_sessions_consecutive_failures = 0
+
+    async def test_iteration_survives_exception_in_maintain_main_interface(self):
+        self.network._maintain_main_interface = AsyncMock(side_effect=RuntimeError("boom"))
+        await self.network._maintain_sessions_iteration()  # must not raise
+        self.network._maintain_main_interface.assert_awaited_once()
+
+    async def test_iteration_does_not_swallow_cancellation(self):
+        self.network._maintain_main_interface = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await self.network._maintain_sessions_iteration()
+
+    async def test_iteration_backs_off_on_repeated_failures(self):
+        """A persistently failing iteration must return an increasing delay instead of the
+        base 0.1s -- otherwise it hot-loops logging a full traceback every 0.1s forever."""
+        self.network._maintain_main_interface = AsyncMock(side_effect=RuntimeError("boom"))
+        delay_1 = await self.network._maintain_sessions_iteration()
+        delay_2 = await self.network._maintain_sessions_iteration()
+        self.assertGreater(delay_2, delay_1)
+        self.assertLessEqual(delay_2, MAINTAIN_SESSIONS_ITERATION_MAX_DELAY)
+
+    async def test_iteration_resets_backoff_after_success(self):
+        self.network._maintain_main_interface = AsyncMock(side_effect=RuntimeError("boom"))
+        await self.network._maintain_sessions_iteration()
+        await self.network._maintain_sessions_iteration()
+        self.network._maintain_main_interface = AsyncMock()  # next call succeeds
+        delay = await self.network._maintain_sessions_iteration()
+        self.assertEqual(delay, MAINTAIN_SESSIONS_ITERATION_BASE_DELAY)
 
 
 if __name__ == "__main__":

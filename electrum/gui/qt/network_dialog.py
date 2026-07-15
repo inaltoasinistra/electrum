@@ -399,9 +399,15 @@ class ServerWidget(QWidget, QtEventListener):
 
         self.status_label_header = QLabel(_('Status') + ':')
         self.status_label = QLabel('')
+        self.reconnect_button = QPushButton(_('Retry'))
+        self.reconnect_button.clicked.connect(self.on_reconnect_clicked)
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(self.status_label)
+        status_layout.addWidget(self.reconnect_button)
+        status_layout.addStretch(1)
         self.status_label_helpbutton = HelpButton(messages.MSG_CONNECTMODE_NODES_HELP)
         grid.addWidget(self.status_label_header, 2, 0)
-        grid.addWidget(self.status_label, 2, 1, 1, 3)
+        grid.addLayout(status_layout, 2, 1, 1, 3)
         grid.addWidget(self.status_label_helpbutton, 2, 4)
 
         msg = _('This is the height of your local copy of the blockchain.')
@@ -501,7 +507,7 @@ class ServerWidget(QWidget, QtEventListener):
         elif not self.server_e.text():
             self.server_e.setText(self.config.NETWORK_SERVER or "")
         for item in [
-                self.status_label_header, self.status_label, self.status_label_helpbutton,
+                self.status_label_header, self.status_label, self.reconnect_button, self.status_label_helpbutton,
                 self.height_label_header, self.height_label, self.height_label_helpbutton]:
             item.setVisible(self.network._was_started)
         self.validate_server_e()
@@ -581,6 +587,15 @@ class ServerWidget(QWidget, QtEventListener):
         )
         _logger.debug(f"set_server: {new_net_params=}")
         self.network.run_from_another_thread(self.network.set_parameters(new_net_params))
+
+    def on_reconnect_clicked(self):
+        # Unlike re-submitting the current server/proxy settings (which set_parameters()
+        # would treat as a no-op), this unconditionally tears down and rebuilds all
+        # interfaces -- for when the connection is stuck (e.g. after the host resumed
+        # from suspend) and the automatic reconnect logic hasn't recovered on its own.
+        _logger.debug("reconnect button clicked")
+        self.network.run_from_another_thread(self.network.restart())
+        self.update()
 
 
 class NostrWidget(QWidget, QtEventListener):
