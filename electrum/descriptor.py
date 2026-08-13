@@ -812,6 +812,12 @@ class TRDescriptor(Descriptor):
     def is_taproot(self) -> bool:
         return True
 
+    def get_simple_singlesig(self) -> Optional['Descriptor']:
+        # unlike sh()/wsh(), tr() holds its (internal) key directly rather than via a
+        # subdescriptor, so the base class's subdescriptors-based recursion doesn't apply here.
+        # script-path spending isn't a simple singlesig, only bare key-path tr(KEY) is.
+        return self if not self.desc_tree else None
+
     # TODO add more test vectors from BIP-0386
     def expand(self, *, pos: Optional[int] = None) -> "ExpandedScripts":
         internal_pubkey = self.pubkeys[0].get_pubkey_bytes(pos=pos, x_only=True)

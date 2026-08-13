@@ -39,7 +39,7 @@ from .bip32 import (convert_bip32_strpath_to_intpath, BIP32_PRIME,
                     is_xpub, is_xprv, BIP32Node, normalize_bip32_derivation,
                     convert_bip32_intpath_to_strpath, is_xkey_consistent_with_key_origin_info,
                     KeyOriginInfo)
-from .descriptor import PubkeyProvider
+from .descriptor import PubkeyProvider, Descriptor, parse_descriptor
 from . import crypto
 from .crypto import (pw_decode, pw_encode, sha256, sha256d, PW_HASH_VERSION_LATEST,
                      SUPPORTED_PW_HASH_VERSIONS, UnsupportedPasswordHashVersion, hash_160,
@@ -1309,3 +1309,58 @@ def from_master_key(text: str) -> Union[BIP32_KeyStore, Old_KeyStore]:
     else:
         raise BitcoinException('Invalid master key')
     return k
+
+
+def _parse_singlesig_descriptor(text: str) -> Optional[Descriptor]:
+    """Returns the single, xpub/xprv-based PubkeyProvider descriptor `text` boils down to
+    (key-path-only tr(), or pk/pkh/wpkh/sh(wpkh)), for use as a watch-only Standard_Wallet
+    keystore -- or None if `text` isn't such a descriptor.
+
+    Unlike a bare xpub, a descriptor can also carry key-origin info (root fingerprint +
+    derivation path), which a depth>1 xpub cannot represent on its own
+    (see bip32.root_fp_and_der_prefix_from_xkey).
+    """
+    try:
+        desc = parse_descriptor(text)
+    except Exception:
+        return None
+    simple = desc.get_simple_singlesig()
+    if simple is None:
+        return None
+    pubkey_provider = simple.pubkeys[0]
+    if pubkey_provider.extkey is None:  # bare (non-extended) pubkey, nothing to derive addresses from
+        return None
+    if pubkey_provider.deriv_path not in ('/0/*', '/1/*'):  # not a wildcard receiving/change branch
+        return None
+    return simple
+
+
+def is_singlesig_descriptor(text: str) -> bool:
+    return _parse_singlesig_descriptor(text) is not None
+
+
+def from_singlesig_descriptor(text: str) -> BIP32_KeyStore:
+    simple = _parse_singlesig_descriptor(text)
+    if simple is None:
+        raise BitcoinException('Not a supported single-sig descriptor')
+    pubkey_provider = simple.pubkeys[0]
+    xkey = pubkey_provider.pubkey
+    k = from_xprv(xkey) if is_xprv(xkey) else from_xpub(xkey)
+    if pubkey_provider.origin is not None:
+        k.add_key_origin(
+            derivation_prefix=pubkey_provider.origin.get_derivation_path(),
+            root_fingerprint=pubkey_provider.origin.fingerprint.hex().lower(),
+        )
+    if simple.to_legacy_electrum_script_type() == 'p2tr':
+        k.script_type = 'p2tr'
+    return k
+
+
+def is_master_key_or_descriptor(text: str) -> bool:
+    return is_master_key(text) or is_singlesig_descriptor(text)
+
+
+def from_master_key_or_descriptor(text: str) -> Union[BIP32_KeyStore, Old_KeyStore]:
+    if is_master_key(text):
+        return from_master_key(text)
+    return from_singlesig_descriptor(text)

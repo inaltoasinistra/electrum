@@ -379,7 +379,11 @@ class KeystoreWizard(AbstractWizard):
             else:
                 raise Exception('Unsupported seed variant %s' % data['seed_variant'])
         elif data['keystore_type'] == 'masterkey' and 'master_key' in data:
-            return keystore.from_master_key(data['master_key'])
+            if wallet_type == 'multisig':
+                # multisig cosigners are validated/entered as a plain xpub each (validate_master_key),
+                # not a full descriptor -- descriptor-based multisig import is a separate, larger feature.
+                return keystore.from_master_key(data['master_key'])
+            return keystore.from_master_key_or_descriptor(data['master_key'])
         elif data['keystore_type'] == 'hardware':
             return self.hw_keystore(data)
         else:
@@ -652,10 +656,15 @@ class NewWalletWizard(KeystoreWizard):
         validation_message = ''
         key_valid = False
 
-        if not keystore.is_master_key(key):
+        # multisig cosigners are entered as a plain xpub each, not a full descriptor -- see
+        # the matching restriction in keystore_from_data().
+        accept_descriptor = wallet_type != 'multisig'
+        is_valid_input = (keystore.is_master_key_or_descriptor(key) if accept_descriptor
+                          else keystore.is_master_key(key))
+        if not is_valid_input:
             validation_message = _('Not a master key')
         else:
-            k = keystore.from_master_key(key)
+            k = keystore.from_master_key_or_descriptor(key) if accept_descriptor else keystore.from_master_key(key)
             if wallet_type == 'standard':
                 if isinstance(k, keystore.Xpub):  # has bip32 xpub
                     t1 = xpub_type(k.xpub)
@@ -741,7 +750,10 @@ class NewWalletWizard(KeystoreWizard):
             else:
                 raise NotImplementedError('unsupported/unknown seed_type %s' % data['seed_type'])
         elif data['keystore_type'] == 'masterkey':
-            k = keystore.from_master_key(data['master_key'])
+            if data['wallet_type'] == 'multisig':
+                k = keystore.from_master_key(data['master_key'])
+            else:
+                k = keystore.from_master_key_or_descriptor(data['master_key'])
             if isinstance(k, keystore.Xpub):  # has xpub
                 t1 = xpub_type(k.xpub)
                 if data['wallet_type'] == 'multisig':

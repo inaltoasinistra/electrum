@@ -495,6 +495,29 @@ class TestWalletKeystoreAddressIntegrityForMainnet(ElectrumTestCase):
         self.assertIsNone(reloaded_ks.script_type)
         self.assertIsNone(ks.watching_only_keystore().script_type)
 
+    async def test_watch_only_wallet_from_p2tr_descriptor(self):
+        # a bare xpub cannot carry key-origin (fingerprint/derivation) info once its own bip32
+        # depth is > 1, and BIP-86 defines no distinct xpub header for p2tr (unlike zpub/ypub) to
+        # otherwise flag it as taproot -- an output descriptor is the only way to import a p2tr
+        # watch-only account with that information intact. Same BIP-86 test vector as above.
+        descriptor_text = (
+            "tr([73c5da0a/86h/0h/0h]xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)"
+        )
+        self.assertFalse(keystore.is_master_key(descriptor_text))
+        self.assertTrue(keystore.is_singlesig_descriptor(descriptor_text))
+
+        ks = keystore.from_master_key_or_descriptor(descriptor_text)
+        self.assertTrue(isinstance(ks, keystore.BIP32_KeyStore))
+        self.assertEqual(ks.script_type, 'p2tr')
+        self.assertEqual(ks.get_root_fingerprint(), '73c5da0a')
+        self.assertEqual(ks.get_derivation_prefix(), "m/86h/0h/0h")
+        self.assertTrue(ks.is_watching_only())
+
+        w = WalletIntegrityHelper.create_standard_wallet(ks, config=self.config, gap_limit=2)
+        self.assertEqual(w.txin_type, 'p2tr')
+        self.assertEqual(w.get_receiving_addresses()[0], 'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr')
+        self.assertEqual(w.get_receiving_addresses()[1], 'bc1p4qhjn9zdvkux4e44uhx8tc55attvtyu358kutcqkudyccelu0was9fqzwh')
+
     async def test_electrum_multisig_seed_standard(self):
         seed_words = 'blast uniform dragon fiscal ensure vast young utility dinosaur abandon rookie sure'
         self.assertEqual(calc_seed_type(seed_words), 'standard')

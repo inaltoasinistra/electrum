@@ -682,6 +682,25 @@ class WalletWizardTestCase(WizardTestCase):
         v = w.resolve_next(v.view, d)
         self._set_password_and_check_address(v=v, w=w, recv_addr="bc1qq2tmmcngng78nllq2pvrkchcdukemtj56uyue0")
 
+    async def test_create_standard_wallet_have_master_key_p2tr_descriptor(self):
+        # a bare xpub cannot carry key-origin info once its own bip32 depth is > 1, and BIP-86
+        # defines no distinct xpub header for p2tr -- a tr() descriptor is the only way to import
+        # a p2tr watch-only account with that info intact. Same BIP-86 test vector used elsewhere.
+        w = self._wizard_for(wallet_type='standard')
+        v = w._current
+        d = v.wizard_data
+        self.assertEqual('keystore_type', v.view)
+
+        d.update({'keystore_type': 'masterkey'})
+        v = w.resolve_next(v.view, d)
+        self.assertEqual('have_master_key', v.view)
+
+        d.update({
+            'master_key': "tr([73c5da0a/86h/0h/0h]xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)",
+        })
+        v = w.resolve_next(v.view, d)
+        self._set_password_and_check_address(v=v, w=w, recv_addr="bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr")
+
     async def test_create_standard_wallet_haveseed_bip39(self):
         w = self._wizard_for(wallet_type='standard')
         v = w._current
