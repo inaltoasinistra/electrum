@@ -522,7 +522,13 @@ class MasterPublicKeyMixin(ABC):
 
 class Xpub(MasterPublicKeyMixin):
 
-    def __init__(self, *, derivation_prefix: str = None, root_fingerprint: str = None):
+    def __init__(
+            self,
+            *,
+            derivation_prefix: str = None,
+            root_fingerprint: str = None,
+            script_type: str | None = None,
+    ):
         MasterPublicKeyMixin.__init__(self)
         self.xpub = None
         self.xpub_receive = None
@@ -532,6 +538,18 @@ class Xpub(MasterPublicKeyMixin):
         # "key origin" info (subclass should persist these):
         self._derivation_prefix = derivation_prefix  # type: Optional[str]
         self._root_fingerprint = root_fingerprint  # type: Optional[str]
+
+        # Electrum script type for this keystore, when it cannot be recovered from the xpub
+        # header itself (e.g. 'p2tr' -- BIP-86 defines no distinct xpub/xprv version bytes,
+        # so a taproot account xpub is byte-identical to a plain BIP-44 xpub). None for every
+        # other xtype, whose script type is still derived from the xpub header as before.
+        # Lives here (not on BIP32_KeyStore) so Hardware_KeyStore -- which does not subclass
+        # BIP32_KeyStore -- shares the same storage/dump logic instead of silently dropping it.
+        self.script_type: str | None = script_type
+
+    def _add_script_type_to_dump(self, d: dict) -> None:
+        if self.script_type is not None:
+            d['script_type'] = self.script_type
 
     def get_master_public_key(self):
         return self.xpub
@@ -656,7 +674,12 @@ class BIP32_KeyStore(Xpub, Deterministic_KeyStore):
     type = 'bip32'
 
     def __init__(self, d: dict):
-        Xpub.__init__(self, derivation_prefix=d.get('derivation'), root_fingerprint=d.get('root_fingerprint'))
+        Xpub.__init__(
+            self,
+            derivation_prefix=d.get('derivation'),
+            root_fingerprint=d.get('root_fingerprint'),
+            script_type=d.get('script_type'),
+        )
         Deterministic_KeyStore.__init__(self, d)
         self.xpub = d.get('xpub')
         self.xprv = d.get('xprv')
@@ -666,6 +689,7 @@ class BIP32_KeyStore(Xpub, Deterministic_KeyStore):
             'xpub': self.xpub,
             'root_fingerprint': self.get_root_fingerprint(),
             'derivation': self.get_derivation_prefix(),
+            'script_type': self.script_type,
         })
 
     def format_seed(self, seed):
@@ -677,6 +701,7 @@ class BIP32_KeyStore(Xpub, Deterministic_KeyStore):
         d['xprv'] = self.xprv
         d['derivation'] = self.get_derivation_prefix()
         d['root_fingerprint'] = self.get_root_fingerprint()
+        self._add_script_type_to_dump(d)
         return d
 
     def get_master_private_key(self, password) -> str:
@@ -916,7 +941,12 @@ class Hardware_KeyStore(Xpub, KeyStore):
     type = 'hardware'
 
     def __init__(self, d):
-        Xpub.__init__(self, derivation_prefix=d.get('derivation'), root_fingerprint=d.get('root_fingerprint'))
+        Xpub.__init__(
+            self,
+            derivation_prefix=d.get('derivation'),
+            root_fingerprint=d.get('root_fingerprint'),
+            script_type=d.get('script_type'),
+        )
         KeyStore.__init__(self)
         # Errors and other user interaction is done through the wallet's
         # handler.  The handler is per-window and preserved across
@@ -932,6 +962,7 @@ class Hardware_KeyStore(Xpub, KeyStore):
             'xpub': self.xpub,
             'root_fingerprint': self.get_root_fingerprint(),
             'derivation': self.get_derivation_prefix(),
+            'script_type': self.script_type,
         })
 
     def set_label(self, label: Optional[str]) -> None:
@@ -947,7 +978,7 @@ class Hardware_KeyStore(Xpub, KeyStore):
         return f'hw[{self.hw_type}]'
 
     def dump(self):
-        return {
+        d = {
             'type': self.type,
             'hw_type': self.hw_type,
             'xpub': self.xpub,
@@ -956,6 +987,8 @@ class Hardware_KeyStore(Xpub, KeyStore):
             'label': self.label,
             'soft_device_id': self.soft_device_id,
         }
+        self._add_script_type_to_dump(d)
+        return d
 
     def is_watching_only(self):
         """The wallet is not watching-only; the user will be prompted for
@@ -1076,6 +1109,23 @@ def from_bip43_rootseed(
     if xtype is None:
         xtype = xtype_from_derivation(derivation)
     k.add_xprv_from_seed(root_seed, xtype=xtype, derivation=derivation)
+    return k
+
+
+def bip32_keystore_from_bip43_rootseed(
+    root_seed: bytes,
+    *,
+    derivation: str,
+    script_type: str,
+) -> 'BIP32_KeyStore':
+    """Like from_bip43_rootseed(), but takes the wizard-level script_type (which may be
+    'p2tr', for which there is no distinct xpub/xprv header -- see BIP32_KeyStore.script_type)
+    instead of an xtype used directly for xkey header serialization.
+    """
+    xtype_for_header = 'standard' if script_type in ('p2pkh', 'p2tr') else script_type
+    k = from_bip43_rootseed(root_seed, derivation=derivation, xtype=xtype_for_header)
+    if script_type == 'p2tr':
+        k.script_type = 'p2tr'
     return k
 
 

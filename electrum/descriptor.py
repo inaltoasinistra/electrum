@@ -48,6 +48,9 @@ MAX_TAPROOT_DEPTH = 128
 #       e.g. from a hw signer cannot be expected to have a low R.
 DUMMY_DER_SIG = 72 * b"\x00"
 
+# a taproot key-path-spend Schnorr signature is 64 bytes (65 with an explicit non-default sighash byte)
+DUMMY_SCHNORR_SIG = 64 * b"\x00"
+
 
 class ExpandedScripts:
 
@@ -236,7 +239,7 @@ class PubkeyProvider(object):
             s += self.deriv_path
         return s
 
-    def get_pubkey_bytes(self, *, pos: Optional[int] = None) -> bytes:
+    def get_pubkey_bytes(self, *, pos: Optional[int] = None, x_only: bool = False) -> bytes:
         if self.is_range() and pos is None:
             raise ValueError("pos must be set for ranged descriptor")
         # note: if not ranged, we ignore pos.
@@ -244,7 +247,7 @@ class PubkeyProvider(object):
             compressed = True  # bip32 implies compressed pubkeys
             if self.deriv_path is None:
                 assert not self.is_range()
-                return self.extkey.eckey.get_public_key_bytes(compressed=compressed)
+                pubkey_bytes = self.extkey.eckey.get_public_key_bytes(compressed=compressed)
             else:
                 path_str = self.deriv_path[1:]
                 if self.is_range():
@@ -252,10 +255,16 @@ class PubkeyProvider(object):
                     path_str = path_str[:-1] + str(pos)
                 path = convert_bip32_strpath_to_intpath(path_str)
                 child_key = self.extkey.subkey_at_public_derivation(path)
-                return child_key.eckey.get_public_key_bytes(compressed=compressed)
+                pubkey_bytes = child_key.eckey.get_public_key_bytes(compressed=compressed)
         else:
             assert not self.is_range()
-            return unhexlify(self.pubkey)
+            pubkey_bytes = unhexlify(self.pubkey)
+        # a bip32-derived key is always 33-byte compressed; a bare hex pubkey may already be
+        # 32-byte x-only (per tr() descriptor string convention) or 33-byte compressed (as used
+        # by get_singlesig_descriptor_from_legacy_leaf) -- strip the sign byte only if present.
+        if x_only and len(pubkey_bytes) == 33:
+            pubkey_bytes = pubkey_bytes[1:]
+        return pubkey_bytes
 
     def get_full_derivation_path(self, *, pos: Optional[int] = None) -> str:
         """
@@ -457,6 +466,8 @@ class Descriptor(object):
         elif (isinstance(self, SHDescriptor) and isinstance(self.subdescriptors[0], WSHDescriptor)
               and isinstance(self.subdescriptors[0].subdescriptors[0], MultisigDescriptor)):
             return "p2wsh-p2sh"
+        elif isinstance(self, TRDescriptor):
+            return "p2tr"
         return "unknown"
 
 
@@ -803,11 +814,26 @@ class TRDescriptor(Descriptor):
 
     # TODO add more test vectors from BIP-0386
     def expand(self, *, pos: Optional[int] = None) -> "ExpandedScripts":
-        internal_pubkey = self.pubkeys[0].get_pubkey_bytes(pos=pos)
+        internal_pubkey = self.pubkeys[0].get_pubkey_bytes(pos=pos, x_only=True)
         script_tree = None
         if self.desc_tree:
             def transform(tree_node):
                 if isinstance(tree_node, Descriptor):
+                    # BIP-342: OP_CHECKSIG in a tapscript leaf only verifies against a 32-byte
+                    # x-only pubkey; any other size is an "unknown pubkey type" for which the
+                    # check succeeds unconditionally, i.e. the leaf becomes spendable by anyone
+                    # with no valid signature at all. leaf_script here is built by subdescriptors
+                    # (e.g. pk()) that don't know they're inside a taproot tree and may push a
+                    # 33-byte compressed pubkey (this happens for any bip32-derived key, since
+                    # PubkeyProvider.get_pubkey_bytes() defaults to compressed encoding) -- refuse
+                    # to build the output script rather than silently produce an anyone-can-spend
+                    # leaf.
+                    non_x_only_pubkeys = [pk for pk in tree_node.get_all_pubkeys() if len(pk) != 32]
+                    if non_x_only_pubkeys:
+                        raise NotImplementedError(
+                            "tr() script-path leaf uses a non-32-byte (not x-only) pubkey; "
+                            "this is not supported as it would create an anyone-can-spend script "
+                            f"under BIP-342: {[pk.hex() for pk in non_x_only_pubkeys]}")
                     leaf_version = 0xc0
                     leaf_script = tree_node.expand(pos=pos).scriptcode_for_sighash  # FIXME maybe rename scriptcode_for_sighash
                     return (leaf_version, leaf_script)
@@ -818,6 +844,32 @@ class TRDescriptor(Descriptor):
         return ExpandedScripts(
             output_script=output_script,
         )
+
+    def _satisfy_inner(self, *, sigdata=None, allow_dummy=False) -> ScriptSolutionInner:
+        if sigdata is None: sigdata = {}
+        assert not self.is_range()
+        if self.desc_tree:
+            # script-path (leaf) spending is not implemented; only key-path spending is
+            raise NotImplementedError("satisfying tr() script-path spends is not implemented")
+        # sigdata is keyed by the same (33-byte compressed) pubkey encoding get_all_pubkeys()
+        # uses (Descriptor.get_all_pubkeys() calls get_pubkey_bytes() without x_only=True), so
+        # that it lines up with what PartialTransaction.sign() looks up in txin.pubkeys.
+        pubkey = self.pubkeys[0].get_pubkey_bytes()
+        sig = sigdata.get(pubkey)
+        if sig is None and allow_dummy:
+            sig = DUMMY_SCHNORR_SIG
+        if sig is None:
+            raise MissingSolutionPiece(f"no sig for {pubkey.hex()}")
+        # a taproot key-path witness is just the signature -- the pubkey is already committed
+        # to in the output script, unlike e.g. p2wpkh where it must be pushed separately.
+        return ScriptSolutionInner(
+            witness_items=(sig,),
+        )
+
+    def get_satisfaction_progress(self, *, sigdata=None) -> Tuple[int, int]:
+        if sigdata is None: sigdata = {}
+        pubkey = self.pubkeys[0].get_pubkey_bytes()
+        return (1 if pubkey in sigdata else 0), 1
 
     def get_max_tree_depth(self) -> Optional[int]:
         if not self.desc_tree:
@@ -1045,6 +1097,8 @@ def get_singlesig_descriptor_from_legacy_leaf(*, pubkey: str, script_type: str) 
     elif script_type == 'p2wpkh-p2sh':
         wpkh = WPKHDescriptor(pubkey=pubkey)
         return SHDescriptor(subdescriptor=wpkh)
+    elif script_type == 'p2tr':
+        return TRDescriptor(internal_key=pubkey)
     else:
         raise NotLegacySinglesigScriptType(f"unexpected {script_type=}")
 

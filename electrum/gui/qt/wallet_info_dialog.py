@@ -15,6 +15,7 @@ from electrum.plugin import run_hook
 from electrum.i18n import _
 from electrum.wallet import Multisig_Wallet
 from electrum.wizard import WizardViewState
+from electrum.descriptor import PubkeyProvider, TRDescriptor
 
 from .main_window import protected
 from electrum.gui.qt.wizard.wallet import QEKeystoreWizard
@@ -26,6 +27,21 @@ from .util import (
 
 if TYPE_CHECKING:
     from .main_window import ElectrumWindow
+
+
+def _master_public_key_text(ks) -> str:
+    # BIP-86 defines no distinct xpub/xprv header for taproot, so the bare xpub returned by
+    # ks.get_master_public_key() is indistinguishable from a legacy wallet's -- show a tr()
+    # descriptor instead, which is what other taproot-aware software (Sparrow, Bitcoin Core)
+    # expects when importing/watching a taproot account.
+    if getattr(ks, 'script_type', None) == 'p2tr':
+        receiving_pubkey = PubkeyProvider(
+            origin=ks.get_key_origin_info(),
+            pubkey=ks.get_bip32_node_for_xpub()._replace(xtype="standard").to_xkey(),
+            deriv_path="/0/*",
+        )
+        return TRDescriptor(internal_key=receiving_pubkey).to_string()
+    return ks.get_master_public_key()
 
 
 class WalletInfoDialog(WindowModalDialog):
@@ -126,7 +142,7 @@ class WalletInfoDialog(WindowModalDialog):
                 label = f'{ks.label}' if hasattr(ks, 'label') and ks.label else ''
                 ks_vbox.addWidget(QLabel(_('Type') + ': ' + f'{ks.get_type_text()}' + ' ' + label))
 
-                mpk_text = ShowQRTextEdit(ks.get_master_public_key(), config=config)
+                mpk_text = ShowQRTextEdit(_master_public_key_text(ks), config=config)
                 mpk_text.setMaximumHeight(max(150, 10 * font_height()))
                 mpk_text.addCopyButton()
                 run_hook('show_xpub_button', mpk_text, ks)

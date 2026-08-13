@@ -365,17 +365,17 @@ class KeystoreWizard(AbstractWizard):
                 derivation = normalize_bip32_derivation(data['derivation_path'])
                 if wallet_type == 'multisig':
                     script = data['script_type'] if data['script_type'] != 'p2sh' else 'standard'
-                else:
-                    script = data['script_type'] if data['script_type'] != 'p2pkh' else 'standard'
-                return keystore.from_bip43_rootseed(root_seed, derivation=derivation, xtype=script)
+                    return keystore.from_bip43_rootseed(root_seed, derivation=derivation, xtype=script)
+                return keystore.bip32_keystore_from_bip43_rootseed(
+                    root_seed, derivation=derivation, script_type=data['script_type'])
             elif data['seed_variant'] == 'slip39':
                 root_seed = data['seed'].decrypt(seed_extension)
                 derivation = normalize_bip32_derivation(data['derivation_path'])
                 if wallet_type == 'multisig':
                     script = data['script_type'] if data['script_type'] != 'p2sh' else 'standard'
-                else:
-                    script = data['script_type'] if data['script_type'] != 'p2pkh' else 'standard'
-                return keystore.from_bip43_rootseed(root_seed, derivation=derivation, xtype=script)
+                    return keystore.from_bip43_rootseed(root_seed, derivation=derivation, xtype=script)
+                return keystore.bip32_keystore_from_bip43_rootseed(
+                    root_seed, derivation=derivation, script_type=data['script_type'])
             else:
                 raise Exception('Unsupported seed variant %s' % data['seed_variant'])
         elif data['keystore_type'] == 'masterkey' and 'master_key' in data:
@@ -731,9 +731,10 @@ class NewWalletWizard(KeystoreWizard):
                 derivation = normalize_bip32_derivation(data['derivation_path'])
                 if data['wallet_type'] == 'multisig':
                     script = data['script_type'] if data['script_type'] != 'p2sh' else 'standard'
+                    k = keystore.from_bip43_rootseed(root_seed, derivation=derivation, xtype=script)
                 else:
-                    script = data['script_type'] if data['script_type'] != 'p2pkh' else 'standard'
-                k = keystore.from_bip43_rootseed(root_seed, derivation=derivation, xtype=script)
+                    k = keystore.bip32_keystore_from_bip43_rootseed(
+                        root_seed, derivation=derivation, script_type=data['script_type'])
             elif is_any_2fa_seed_type(data['seed_type']):
                 self._logger.debug('creating keystore from 2fa seed')
                 k = keystore.from_xprv(data['x1']['xprv'])

@@ -230,6 +230,11 @@ class TestDescriptor(ElectrumTestCase):
         self.assertEqual(desc.pubkeys[0].deriv_path, "/0/0")
         self.assertEqual(desc.get_max_tree_depth(), None)
         self.assertEqual(desc.to_string_no_checksum(), d)
+        # regression test: expand() must strip the bip32-derived key down to 32-byte x-only
+        # before building the output script, not pass the 33-byte compressed pubkey through.
+        e = desc.expand()
+        self.assertEqual(len(e.output_script), 34)
+        self.assertEqual(e.output_script.hex(), "5120bbab84057ac362fb08b6abac176cfe561acbc20a2c91d5183b4af3fb83ffd2b7")
 
         d = "tr([00000001/84h/1h/0h]tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/0/0,{pk(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B),{{pk(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B),pk(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B)},pk(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B)}})"
         desc = parse_descriptor(d)
@@ -247,6 +252,13 @@ class TestDescriptor(ElectrumTestCase):
         self.assertEqual(desc.desc_tree[1][1].to_string_no_checksum(), "pk(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B)")
         self.assertEqual(desc.get_max_tree_depth(), 3)
         self.assertEqual(desc.to_string_no_checksum(), d)
+        # regression test: a script-path leaf built from a bip32-derived key pushes a 33-byte
+        # compressed pubkey, not a 32-byte x-only one. Per BIP-342, OP_CHECKSIG with a pubkey of
+        # any size other than 32 bytes is treated as an unknown pubkey type and the check
+        # succeeds unconditionally -- i.e. that leaf would be spendable by anyone with no valid
+        # signature at all. expand() must refuse to build such an output script.
+        with self.assertRaises(NotImplementedError):
+            desc.expand()
 
     def test_tr_descriptor_bip386(self):
         # test vectors from https://github.com/bitcoin/bips/blob/e2f7481a132e1c5863f5ffcbff009964d7c2af20/bip-0386.mediawiki#test-vectors

@@ -71,7 +71,7 @@ class WalletUnfinished(WalletFileException):
 # seed_version is now used for the version of the wallet file
 OLD_SEED_VERSION = 4        # electrum versions < 2.0
 NEW_SEED_VERSION = 11       # electrum versions >= 2.0
-FINAL_SEED_VERSION = 71     # electrum >= 2.7 will set this to prevent
+FINAL_SEED_VERSION = 72     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
@@ -260,6 +260,7 @@ class WalletDBUpgrader(Logger):
         self._convert_version_69()
         self._convert_version_70()
         self._convert_version_71()
+        self._convert_version_72()
         self.put('seed_version', FINAL_SEED_VERSION)  # just to be sure
 
     def _convert_wallet_type(self):
@@ -1435,6 +1436,17 @@ class WalletDBUpgrader(Logger):
         # if so, save genesis hash
         self.data['genesis_blockhash'] = constants.net.GENESIS
         self.data['seed_version'] = 71
+
+    def _convert_version_72(self):
+        """No-op bump, purely to gate wallet files that may contain a p2tr (BIP-86) keystore's
+        'script_type' field. An older Electrum does not know about that field and would
+        silently mis-derive txin_type='p2pkh' for such a keystore (see
+        Standard_Wallet.load_keystore()), so we must refuse to let an old client open the file
+        rather than have it silently misinterpret which addresses hold the wallet's funds.
+        """
+        if not self._is_upgrade_method_needed(71, 71):
+            return
+        self.data['seed_version'] = 72
 
     def _convert_imported(self):
         if not self._is_upgrade_method_needed(0, 13):

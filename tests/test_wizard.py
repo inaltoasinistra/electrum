@@ -13,6 +13,8 @@ from electrum import slip39
 from electrum.bip32 import KeyOriginInfo
 from electrum import keystore
 from electrum.storage import WalletStorage
+from electrum.util import ChoiceItem
+from electrum.gui.qt.wizard.wallet import WCScriptAndDerivation
 
 from . import ElectrumTestCase
 from .test_wallet_vertical import UNICODE_HORROR, WalletIntegrityHelper
@@ -699,6 +701,38 @@ class WalletWizardTestCase(WizardTestCase):
         v = w.resolve_next(v.view, d)
         self._set_password_and_check_address(v=v, w=w, recv_addr="bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu")
 
+    async def test_create_standard_wallet_haveseed_bip39_p2tr(self):
+        # anchored to BIP-86's own published test vectors:
+        # https://github.com/bitcoin/bips/blob/master/bip-0086.mediawiki#test-vectors
+        w = self._wizard_for(wallet_type='standard')
+        v = w._current
+        d = v.wizard_data
+        self.assertEqual('keystore_type', v.view)
+
+        d.update({'keystore_type': 'haveseed'})
+        v = w.resolve_next(v.view, d)
+        self.assertEqual('have_seed', v.view)
+
+        d.update({'seed': 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+                  'seed_type': 'bip39', 'seed_extend': False, 'seed_variant': 'bip39'})
+        v = w.resolve_next(v.view, d)
+        self.assertEqual('script_and_derivation', v.view)
+
+        d.update({'script_type': 'p2tr', 'derivation_path': "m/86h/0h/0h"})
+        v = w.resolve_next(v.view, d)
+        wallet = self._set_password_and_check_address(
+            v=v, w=w, recv_addr="bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr")
+        self.assertEqual('p2tr', wallet.txin_type)
+        self.assertEqual(
+            'xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ',
+            wallet.keystore.xpub)
+        self.assertEqual(
+            'bc1p4qhjn9zdvkux4e44uhx8tc55attvtyu358kutcqkudyccelu0was9fqzwh',
+            wallet.get_receiving_addresses()[1])
+        self.assertEqual(
+            'bc1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wqwruhk7',
+            wallet.get_change_addresses()[0])
+
     async def test_create_standard_wallet_haveseed_bip39_passphrase(self):
         w = self._wizard_for(wallet_type='standard')
         v = w._current
@@ -1170,3 +1204,69 @@ class WalletWizardTestCase(WizardTestCase):
             {"bc1qq2tmmcngng78nllq2pvrkchcdukemtj56uyue0", "1LNvv5h6QHoYv1nJcqrp13T2TBkD2sUGn1", "1FJEEB8ihPMbzs2SkLmr37dHyRFzakqUmo"},
         )
         self.assertFalse(wallet.can_enable_disable_keystore(wallet.keystore))
+
+
+class ScriptTypeChoicesSupportedByDeviceTestCase(WizardTestCase):
+    """WCScriptAndDerivation._choices_supported_by_device: the forward-compat guarantee that a
+    hardware plugin declaring support for a new xtype (e.g. 'p2tr') makes the wizard offer it,
+    with no further wizard change needed. Exercised as a staticmethod, not via the Qt widget
+    itself -- the filtering is pure logic and doesn't need a QWidget/QApplication to test.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.choices = [
+            ChoiceItem(key='standard', label='legacy (p2pkh)'),
+            ChoiceItem(key='p2wpkh-p2sh', label='p2sh-segwit (p2wpkh-p2sh)'),
+            ChoiceItem(key='p2wpkh', label='native segwit (p2wpkh)'),
+            ChoiceItem(key='p2tr', label='taproot (p2tr)'),
+        ]
+
+    def _hardware_device(self, plugin_name: str) -> tuple:
+        return (
+            plugin_name,
+            DeviceInfo(
+                device=Device(path='webusb:002:1', interface_number=-1, id_='webusb:002:1',
+                               product_key='Trezor', usage_page=0, transport_ui_string='webusb:002:1'),
+                label='unittests', initialized=True, exception=None, plugin_name=plugin_name,
+                soft_device_id='deadbeef', model_name='Test Device'))
+
+    def test_no_hardware_device_leaves_choices_unfiltered(self):
+        """The software-keystore path: nothing to filter against, so choices pass through."""
+        out_choices, out_default = WCScriptAndDerivation._choices_supported_by_device(
+            self.choices, 'p2tr', hardware_device=None, plugins=self.plugins)
+        self.assertEqual(self.choices, out_choices)
+        self.assertEqual('p2tr', out_default)
+
+    def test_hardware_device_omits_choice_not_in_supported_xtypes(self):
+        """Trezor's SUPPORTED_XTYPES doesn't list 'p2tr' (yet) -- it must not be offered."""
+        out_choices, out_default = WCScriptAndDerivation._choices_supported_by_device(
+            self.choices, 'p2wpkh', hardware_device=self._hardware_device('trezor'), plugins=self.plugins)
+        self.assertEqual(['standard', 'p2wpkh-p2sh', 'p2wpkh'], [c.key for c in out_choices])
+        self.assertEqual('p2wpkh', out_default)
+
+    def test_hardware_device_resets_default_choice_if_filtered_out(self):
+        out_choices, out_default = WCScriptAndDerivation._choices_supported_by_device(
+            self.choices, 'p2tr', hardware_device=self._hardware_device('trezor'), plugins=self.plugins)
+        self.assertNotIn('p2tr', [c.key for c in out_choices])
+        self.assertEqual('standard', out_default)
+
+    def test_hardware_device_choice_reappears_once_plugin_declares_support(self):
+        """The actual forward-compat guarantee: SUPPORTED_XTYPES is the only thing gating this."""
+        trezor_plugin = self.plugins.get_plugin('trezor')
+        original_xtypes = trezor_plugin.SUPPORTED_XTYPES
+        trezor_plugin.SUPPORTED_XTYPES = original_xtypes + ('p2tr',)
+        try:
+            out_choices, out_default = WCScriptAndDerivation._choices_supported_by_device(
+                self.choices, 'p2tr', hardware_device=self._hardware_device('trezor'), plugins=self.plugins)
+        finally:
+            trezor_plugin.SUPPORTED_XTYPES = original_xtypes
+        self.assertIn('p2tr', [c.key for c in out_choices])
+        self.assertEqual('p2tr', out_default)
+
+    def test_unresolvable_plugin_leaves_choices_unfiltered(self):
+        """A plugin name that fails to resolve must fail open, not hide every choice."""
+        out_choices, out_default = WCScriptAndDerivation._choices_supported_by_device(
+            self.choices, 'p2tr', hardware_device=self._hardware_device('not_a_real_plugin'), plugins=self.plugins)
+        self.assertEqual(self.choices, out_choices)
+        self.assertEqual('p2tr', out_default)

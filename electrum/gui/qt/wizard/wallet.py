@@ -665,6 +665,7 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
     def __init__(self, parent, wizard):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Script type and Derivation path'))
         Logger.__init__(self)
+        self.plugins = wizard.plugins
 
         self.choice_w = None  # type: ChoiceWidget
         self.derivation_path_edit = None
@@ -707,6 +708,8 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
                            extra_data=bip44_derivation(0, bip43_purpose=49)),
                 ChoiceItem(key='p2wpkh', label='native segwit (p2wpkh)',
                            extra_data=bip44_derivation(0, bip43_purpose=84)),
+                ChoiceItem(key='p2tr', label='taproot (p2tr)',
+                           extra_data=bip44_derivation(0, bip43_purpose=86)),
             ]
 
         if self.wizard_data['wallet_type'] == 'standard' and not self.wizard_data['keystore_type'] == 'hardware':
@@ -735,6 +738,14 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
             self.layout().addWidget(button, alignment=Qt.AlignmentFlag.AlignLeft)
             self.layout().addWidget(QLabel(_("Or")))
 
+        if self.wizard_data['keystore_type'] == 'hardware':
+            cosigner_data = self.wizard.current_cosigner(self.wizard_data)
+            choices, default_choice = self._choices_supported_by_device(
+                choices, default_choice,
+                hardware_device=cosigner_data.get('hardware_device'),
+                plugins=self.plugins,
+            )
+
         def on_choice_click(index):
             self.derivation_path_edit.setText(self.choice_w.selected_item.extra_data)
         self.choice_w = ChoiceWidget(message=message1, choices=choices, default_key=default_choice)
@@ -753,6 +764,43 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
 
         self.layout().addStretch(1)
         self.layout().addWidget(self.warn_label)
+
+    @staticmethod
+    def _choices_supported_by_device(
+            choices: List[ChoiceItem],
+            default_choice: str,
+            *,
+            hardware_device: Optional[tuple],
+            plugins: 'Plugins',
+    ) -> Tuple[List[ChoiceItem], str]:
+        """Hide script types the connected hardware device doesn't declare support for.
+
+        This screen is shared by every hw plugin's wizard flow (registered as e.g.
+        'trezor_start'), so the choices built above are the same regardless of keystore type;
+        without this filter, selecting an unsupported one (e.g. taproot on a device that
+        doesn't support it yet) only fails later, deep in WCHWXPub.get_xpub_from_client, with
+        a raw exception. Filtering here is also self-maintaining: once a plugin adds a new
+        xtype to SUPPORTED_XTYPES, the option reappears automatically, no wizard change needed.
+        A staticmethod taking explicit args (rather than reading self.wizard_data etc.) so it's
+        unit-testable without instantiating the underlying QWidget.
+        """
+        if hardware_device is None:
+            return choices, default_choice
+        _name, info = hardware_device
+        try:
+            plugin = plugins.get_plugin(info.plugin_name)
+        except Exception:
+            # e.g. an unknown/unauthorized plugin name, or one that failed to load its
+            # underlying hardware library -- fail open rather than hide every choice.
+            return choices, default_choice
+        if plugin is None:
+            return choices, default_choice
+        supported_choices = [c for c in choices if c.key in plugin.SUPPORTED_XTYPES]
+        if not supported_choices:
+            return choices, default_choice
+        if default_choice not in [c.key for c in supported_choices]:
+            default_choice = supported_choices[0].key
+        return supported_choices, default_choice
 
     def validate(self):
         self.apply()

@@ -2740,6 +2740,8 @@ class Abstract_Wallet(ABC, Logger, EventListener):
             multi = descriptor.MultisigDescriptor(pubkeys=pubkeys, thresh=self.m, is_sorted=True)
             wsh = descriptor.WSHDescriptor(subdescriptor=multi)
             return descriptor.SHDescriptor(subdescriptor=wsh)
+        elif script_type == 'p2tr':
+            return descriptor.TRDescriptor(internal_key=pubkeys[0])
         else:
             raise NotImplementedError(f"unexpected {script_type=}")
 
@@ -4342,6 +4344,12 @@ class Standard_Wallet(Simple_Wallet, Deterministic_Wallet):
 
     def load_keystore(self):
         self.keystore = load_keystore(self.db, 'keystore')  # type: KeyStoreWithMPK
+        if getattr(self.keystore, 'script_type', None) == 'p2tr':
+            # BIP-86 defines no distinct xpub/xprv header for taproot, so the script type
+            # cannot be recovered from the xpub bytes the way it can for p2wpkh/p2wpkh-p2sh
+            # (see BIP32_KeyStore.script_type).
+            self.txin_type = 'p2tr'
+            return
         try:
             xtype = bip32.xpub_type(self.keystore.xpub)
         except Exception:

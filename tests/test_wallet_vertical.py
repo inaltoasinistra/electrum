@@ -19,7 +19,8 @@ from electrum.wallet import (sweep, Multisig_Wallet, Standard_Wallet, Imported_W
                              TxSighashRiskLevel, CannotDoubleSpendTx)
 from electrum.util import bfh, NotEnoughFunds, UnrelatedTransactionException, UserFacingException, TxMinedInfo
 from electrum.fee_policy import FixedFeePolicy
-from electrum.transaction import Transaction, PartialTxOutput, tx_from_any, Sighash
+from electrum.transaction import (Transaction, PartialTxOutput, tx_from_any, Sighash,
+                                   PartialTxInput, TxOutpoint, PartialTransaction)
 from electrum.mnemonic import calc_seed_type
 from electrum.network import Network
 
@@ -102,6 +103,23 @@ def read_test_vector(filename: str):
     path = os.path.join(os.path.dirname(__file__), filename)
     data = read_json_file(path)
     return data
+
+
+class _StubHardwareKeyStore(keystore.Hardware_KeyStore):
+    """Minimal concrete Hardware_KeyStore for tests -- real subclasses (TrezorKeyStore etc.) live
+    in plugin modules and require a connected device to actually sign; these stubs exist only so
+    tests can exercise the (non-hardware-specific) storage plumbing in Hardware_KeyStore itself."""
+
+    hw_type = '_test_stub'
+
+    def decrypt_message(self, sequence, message, password):
+        raise NotImplementedError
+
+    def sign_message(self, sequence, message, password, *, script_type=None):
+        raise NotImplementedError
+
+    def sign_transaction(self, tx, password):
+        raise NotImplementedError
 
 
 class TestWalletKeystoreAddressIntegrityForMainnet(ElectrumTestCase):
@@ -403,6 +421,79 @@ class TestWalletKeystoreAddressIntegrityForMainnet(ElectrumTestCase):
 
         self.assertEqual(w.get_receiving_addresses()[0], 'bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu')
         self.assertEqual(w.get_change_addresses()[0], 'bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el')
+
+    async def test_bip39_seed_bip86_taproot(self):
+        # test vectors from https://github.com/bitcoin/bips/blob/master/bip-0086.mediawiki#test-vectors
+        seed_words = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
+        self.assertEqual(keystore.bip39_is_checksum_valid(seed_words), (True, True))
+
+        root_seed = keystore.bip39_to_seed(seed_words, passphrase='')
+        ks = keystore.bip32_keystore_from_bip43_rootseed(root_seed, derivation="m/86'/0'/0'", script_type='p2tr')
+
+        self.assertTrue(isinstance(ks, keystore.BIP32_KeyStore))
+        self.assertEqual(ks.script_type, 'p2tr')
+
+        self.assertEqual(ks.xprv, 'xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk')
+        self.assertEqual(ks.xpub, 'xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ')
+
+        # script_type must survive a dump()/reload() round-trip, and so must watching_only_keystore()
+        db = WalletDB('', storage=None, upgrade=True)
+        db.put('keystore', ks.dump())
+        reloaded_ks = keystore.load_keystore(db, 'keystore')
+        self.assertEqual('p2tr', reloaded_ks.script_type)
+        self.assertEqual('p2tr', ks.watching_only_keystore().script_type)
+
+        w = WalletIntegrityHelper.create_standard_wallet(ks, config=self.config, gap_limit=2)
+        self.assertEqual(w.txin_type, 'p2tr')
+
+        self.assertEqual(w.get_receiving_addresses()[0], 'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr')
+        self.assertEqual(w.get_receiving_addresses()[1], 'bc1p4qhjn9zdvkux4e44uhx8tc55attvtyu358kutcqkudyccelu0was9fqzwh')
+        self.assertEqual(w.get_change_addresses()[0], 'bc1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wqwruhk7')
+
+    async def test_hardware_keystore_script_type_roundtrip(self):
+        # Hardware_KeyStore does not subclass BIP32_KeyStore, so it needs its own coverage that
+        # script_type (declared on the shared Xpub base) actually round-trips through dump()/
+        # load_keystore() -- unlike BIP32_KeyStore.dump(), Hardware_KeyStore.dump() used to build
+        # a hardcoded literal dict that never chained to a base, which would have silently
+        # dropped the field on save. No plugin sets script_type on a hw keystore yet; this is
+        # about the storage plumbing being correct once one does.
+        keystore.register_keystore('_test_stub', _StubHardwareKeyStore)
+        self.addCleanup(keystore.hw_keystores.pop, '_test_stub', None)
+
+        xpub = 'xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ'
+        ks = _StubHardwareKeyStore({
+            'xpub': xpub,
+            'derivation': "m/86'/0'/0'",
+            'root_fingerprint': '73c5da0a',
+            'hw_type': '_test_stub',
+            'script_type': 'p2tr',
+        })
+        self.assertEqual('p2tr', ks.script_type)
+
+        db = WalletDB('', storage=None, upgrade=True)
+        db.put('keystore', ks.dump())
+        reloaded_ks = keystore.load_keystore(db, 'keystore')
+        self.assertIsInstance(reloaded_ks, _StubHardwareKeyStore)
+        self.assertEqual('p2tr', reloaded_ks.script_type)
+        self.assertEqual('p2tr', ks.watching_only_keystore().script_type)
+
+    async def test_hardware_keystore_without_script_type_still_dumps_fine(self):
+        # the common case today: no plugin sets script_type on a hw keystore, so it must stay
+        # None through the same round-trip, and the dumped dict must not gain a spurious key
+        # (existing wallet files for every non-p2tr hw keystore must stay byte-identical).
+        keystore.register_keystore('_test_stub', _StubHardwareKeyStore)
+        self.addCleanup(keystore.hw_keystores.pop, '_test_stub', None)
+
+        xpub = 'xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ'
+        ks = _StubHardwareKeyStore({'xpub': xpub, 'hw_type': '_test_stub'})
+        self.assertIsNone(ks.script_type)
+        self.assertNotIn('script_type', ks.dump())
+
+        db = WalletDB('', storage=None, upgrade=True)
+        db.put('keystore', ks.dump())
+        reloaded_ks = keystore.load_keystore(db, 'keystore')
+        self.assertIsNone(reloaded_ks.script_type)
+        self.assertIsNone(ks.watching_only_keystore().script_type)
 
     async def test_electrum_multisig_seed_standard(self):
         seed_words = 'blast uniform dragon fiscal ensure vast young utility dinosaur abandon rookie sure'
@@ -914,6 +1005,44 @@ class TestWalletSending(ElectrumTestCase):
         # wallet level checks
         self.assertEqual((0, funding_output_value - 250000 - 5000 + 100000, 0), wallet1.get_balance())
         self.assertEqual((0, 250000 - 5000 - 100000, 0), wallet2.get_balance())
+
+    async def test_sending_from_p2tr_wallet(self):
+        # exercises the wallet-level dispatch chain (get_script_descriptor_for_address ->
+        # TRDescriptor -> PartialTxInput.is_taproot()==True) that the BIP-341 vector test in
+        # test_transaction.py bypasses by calling sign_txin() directly.
+        root_seed = keystore.bip39_to_seed(
+            'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+            passphrase='')
+        ks = keystore.bip32_keystore_from_bip43_rootseed(root_seed, derivation="m/86'/1'/0'", script_type='p2tr')
+        wallet = WalletIntegrityHelper.create_standard_wallet(ks, config=self.config, gap_limit=2)
+        self.assertEqual('p2tr', wallet.txin_type)
+        recv_addr = wallet.get_receiving_address()
+        self.assertTrue(recv_addr.startswith('tb1p'))
+
+        # bootstrap the wallet with a (synthetic, locally-injected) funding tx paying to our
+        # own p2tr address -- receive_tx_callback only needs a well-formed Transaction, it does
+        # not validate the funding input's signature/witness.
+        dummy_txin = PartialTxInput(
+            prevout=TxOutpoint(txid=bytes.fromhex('11' * 32), out_idx=0),
+            script_sig=b'', witness=b'\x00')
+        funding_out = PartialTxOutput.from_address_and_value(recv_addr, 100_000)
+        funding_tx = Transaction(PartialTransaction.from_io([dummy_txin], [funding_out], locktime=0, version=1).serialize())
+        wallet.adb.receive_tx_callback(funding_tx, tx_height=TX_HEIGHT_UNCONFIRMED)
+
+        outputs = [PartialTxOutput.from_address_and_value(recv_addr, 50_000)]
+        tx = wallet.make_unsigned_transaction(outputs=outputs, fee_policy=FixedFeePolicy(1000), tx_version=2, rbf=False)
+        self.assertTrue(tx.inputs()[0].is_taproot())
+
+        wallet.sign_transaction(tx, password=None)
+        self.assertTrue(tx.is_complete())
+        witness = tx.inputs()[0].witness
+        # a taproot key-path spend witness is a single Schnorr signature (64 bytes, or 65 with
+        # an explicit non-default sighash byte), pushed as the sole witness stack item:
+        # <item_count=1><sig_len><sig bytes>, with both varints fitting in one byte here.
+        item_count, sig_len = witness[0], witness[1]
+        self.assertEqual(1, item_count)
+        self.assertIn(sig_len, (64, 65))
+        self.assertEqual(2 + sig_len, len(witness))
 
     async def test_sending_between_p2sh_2of3_and_uncompressed_p2pkh(self):
         wallet1a = WalletIntegrityHelper.create_multisig_wallet(
