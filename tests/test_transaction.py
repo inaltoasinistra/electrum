@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import os
 from typing import NamedTuple, Union
@@ -1154,3 +1156,130 @@ class TestSighashBIP341(ElectrumTestCase):
             # note: some input utxos are not taproot, and there is no key data for them
             #       - txin_idx=2, addr 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH
             #       - txin_idx=5, addr bc1q0ht9tyks4vh7p5p904t340cr9nvahy7u3re7zg
+
+
+class TestPSBTTaprootFields(ElectrumTestCase):
+    """BIP-371 (Taproot PSBT) test vectors, taken verbatim from
+    https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki#test-vectors
+    """
+
+    # "PSBT with one P2TR key only input with internal key and its derivation path"
+    VALID_INTERNAL_KEY_AND_DERIVATION = (
+        "cHNidP8BAFICAAAAASd0Srq/MCf+DWzyOpbu4u+xiO9SMBlUWFiD5ptmJLJCAAAAAAD/////AUjmBSoBAAAAFgAUdo4e"
+        "60z0IIZgM/gKzv8PlyB0SWkAAAAAAAEBKwDyBSoBAAAAIlEgWiws9bUs8x+DrS6Npj/wMYPs2PYJx1EK6KSOA5EKB1chFv"
+        "40kGTJjW4qhT+jybEr2LMEoZwZXGDvp+4jkwRtP6IyGQB3Ky2nVgAAgAEAAIAAAACAAQAAAAAAAAABFyD+NJBkyY1uKoU/"
+        "o8mxK9izBKGcGVxg76fuI5MEbT+iMgAiAgNrdyptt02HU8mKgnlY3mx4qzMSEJ830+AwRIQkLs5z2Bh3Ky2nVAAAgAEAAI"
+        "AAAACAAAAAAAAAAAAA"
+    )
+    # same, plus PSBT_IN_TAP_KEY_SIG ("...with internal key, its derivation path, and signature")
+    VALID_INTERNAL_KEY_DERIVATION_AND_SIG = (
+        "cHNidP8BAFICAAAAASd0Srq/MCf+DWzyOpbu4u+xiO9SMBlUWFiD5ptmJLJCAAAAAAD/////AUjmBSoBAAAAFgAUdo4e"
+        "60z0IIZgM/gKzv8PlyB0SWkAAAAAAAEBKwDyBSoBAAAAIlEgWiws9bUs8x+DrS6Npj/wMYPs2PYJx1EK6KSOA5EKB1cBE0"
+        "C7U+yRe62dkGrxuocYHEi4as5aritTYFpyXKdGJWMUdvxvW67a9PLuD0d/NvWPOXDVuCc7fkl7l68uPxJcl680IRb+NJB"
+        "kyY1uKoU/o8mxK9izBKGcGVxg76fuI5MEbT+iMhkAdystp1YAAIABAACAAAAAgAEAAAAAAAAAARcg/jSQZMmNbiqFP6PJ"
+        "sSvYswShnBlcYO+n7iOTBG0/ojIAIgIDa3cqbbdNh1PJioJ5WN5seKszEhCfN9PgMESEJC7Oc9gYdystp1QAAIABAACAA"
+        "AAAgAAAAAAAAAAAAA=="
+    )
+    # "PSBT With PSBT_IN_TAP_INTERNAL_KEY key that is too long (incorrectly serialized as compressed DER)"
+    INVALID_INTERNAL_KEY_TOO_LONG = (
+        "cHNidP8BAHECAAAAASd0Srq/MCf+DWzyOpbu4u+xiO9SMBlUWFiD5ptmJLJCAAAAAAD/////Anh8AQAAAAAAFgAUg6fj"
+        "S9mf8DpJYu+KGhAbspVGHs5gawQqAQAAABYAFHrDad8bIOAz1hFmI5V7CsSfPFLoAAAAAAABASsA8gUqAQAAACJRIFosLP"
+        "W1LPMfg60ujaY/8DGD7Nj2CcdRCuikjgORCgdXARchAv40kGTJjW4qhT+jybEr2LMEoZwZXGDvp+4jkwRtP6IyAAAA"
+    )
+    # "PSBT With PSBT_IN_TAP_BIP32_DERIVATION key that is too long (incorrectly serialized as compressed DER)"
+    INVALID_BIP32_DERIVATION_KEY_TOO_LONG = (
+        "cHNidP8BAHECAAAAASd0Srq/MCf+DWzyOpbu4u+xiO9SMBlUWFiD5ptmJLJCAAAAAAD/////Anh8AQAAAAAAFgAUg6fj"
+        "S9mf8DpJYu+KGhAbspVGHs5gawQqAQAAABYAFHrDad8bIOAz1hFmI5V7CsSfPFLoAAAAAAABASsA8gUqAQAAACJRIFosLP"
+        "W1LPMfg60ujaY/8DGD7Nj2CcdRCuikjgORCgdXIhYC/jSQZMmNbiqFP6PJsSvYswShnBlcYO+n7iOTBG0/ojIZAHcrLadW"
+        "AACAAQAAgAAAAIABAAAAAAAAAAAAAA=="
+    )
+
+    EXPECTED_INTERNAL_KEY = "fe349064c98d6e2a853fa3c9b12bd8b304a19c195c60efa7ee2393046d3fa232"
+    EXPECTED_FINGERPRINT = "772b2da7"
+    EXPECTED_PATH = [86 + 2**31, 1 + 2**31, 0 + 2**31, 1, 0]
+
+    @staticmethod
+    def _psbt_kvs(raw: bytes):
+        """Flattened list of (section_index, key_type, key, val) for every k/v pair in a
+        raw (non-base64) PSBT, used to compare two PSBTs by content, independent of the
+        order Electrum happens to write fields in (Electrum's writer does not follow a
+        strict BIP-174 canonical sort across different field types within a section).
+        """
+        f = io.BytesIO(raw)
+        assert f.read(5) == b'psbt\xff'
+        kvs = []
+        section_index = 0
+        while f.tell() < len(raw):
+            try:
+                kt, key, val = transaction.PSBTSection.get_next_kv_from_fd(f)
+            except StopIteration:
+                section_index += 1
+                continue
+            kvs.append((section_index, kt, key, val))
+        return sorted(kvs)
+
+    def test_valid_internal_key_and_derivation(self):
+        tx = tx_from_any(self.VALID_INTERNAL_KEY_AND_DERIVATION)
+        txin = tx.inputs()[0]
+        self.assertEqual(self.EXPECTED_INTERNAL_KEY, txin.tap_internal_key.hex())
+        self.assertEqual(1, len(txin.tap_bip32_paths))
+        pubkey, (leaf_hashes, xfp, path) = next(iter(txin.tap_bip32_paths.items()))
+        self.assertEqual(self.EXPECTED_INTERNAL_KEY, pubkey.hex())
+        self.assertEqual((), leaf_hashes)
+        self.assertEqual(self.EXPECTED_FINGERPRINT, xfp.hex())
+        self.assertEqual(self.EXPECTED_PATH, list(path))
+        self.assertIsNone(txin.tap_key_sig)
+        # round trip: same set of k/v pairs, independent of write order
+        orig = base64.b64decode(self.VALID_INTERNAL_KEY_AND_DERIVATION)
+        reser = tx.serialize_as_bytes()
+        self.assertEqual(self._psbt_kvs(orig), self._psbt_kvs(reser))
+
+    def test_valid_internal_key_derivation_and_sig(self):
+        tx = tx_from_any(self.VALID_INTERNAL_KEY_DERIVATION_AND_SIG)
+        txin = tx.inputs()[0]
+        self.assertEqual(self.EXPECTED_INTERNAL_KEY, txin.tap_internal_key.hex())
+        pubkey, (leaf_hashes, xfp, path) = next(iter(txin.tap_bip32_paths.items()))
+        self.assertEqual(self.EXPECTED_FINGERPRINT, xfp.hex())
+        self.assertEqual(self.EXPECTED_PATH, list(path))
+        self.assertIsNotNone(txin.tap_key_sig)
+        self.assertEqual(64, len(txin.tap_key_sig))
+        orig = base64.b64decode(self.VALID_INTERNAL_KEY_DERIVATION_AND_SIG)
+        reser = tx.serialize_as_bytes()
+        self.assertEqual(self._psbt_kvs(orig), self._psbt_kvs(reser))
+
+    def test_invalid_internal_key_too_long(self):
+        with self.assertRaises(transaction.SerializationError):
+            tx_from_any(self.INVALID_INTERNAL_KEY_TOO_LONG)
+
+    def test_invalid_bip32_derivation_key_too_long(self):
+        with self.assertRaises(transaction.SerializationError):
+            tx_from_any(self.INVALID_BIP32_DERIVATION_KEY_TOO_LONG)
+
+    def test_pack_unpack_tap_bip32_deriv_wire_format(self):
+        """Electrum's own encoder/decoder for the (leaf_hashes, xfp, path) value shape it will
+        always produce for a single key-path-only internal key (empty leaf-hash list, single
+        derivation) -- the zero-hash-count-prefix case, which is the genuinely new part of the
+        wire format compared to the plain (xfp, path) shape already used by BIP32_DERIVATION.
+        """
+        xfp = bfh(self.EXPECTED_FINGERPRINT)
+        path = self.EXPECTED_PATH
+        packed = transaction.pack_tap_bip32_deriv((), xfp, path)
+        # compact-size(0) + xfp + 5 * 4-byte-LE path ints
+        self.assertEqual(b'\x00' + xfp + b''.join(i.to_bytes(4, 'little') for i in path), packed)
+        leaf_hashes, unpacked_xfp, unpacked_path = transaction.unpack_tap_bip32_deriv(packed)
+        self.assertEqual((), leaf_hashes)
+        self.assertEqual(xfp, unpacked_xfp)
+        self.assertEqual(path, list(unpacked_path))
+
+        txin = PartialTxInput(prevout=TxOutpoint(txid=bytes(32), out_idx=0))
+        internal_pubkey = bfh(self.EXPECTED_INTERNAL_KEY)
+        txin.tap_internal_key = internal_pubkey
+        txin.tap_bip32_paths[internal_pubkey] = ((), xfp, path)
+        with io.BytesIO() as buf:
+            txin._serialize_psbt_section(buf)
+            data = buf.getvalue()
+        with io.BytesIO(data) as f:
+            reparsed = PartialTxInput(prevout=TxOutpoint(txid=bytes(32), out_idx=0))
+            reparsed._populate_psbt_fields_from_fd(f)
+        self.assertEqual(internal_pubkey, reparsed.tap_internal_key)
+        self.assertEqual({internal_pubkey: ((), xfp, path)}, reparsed.tap_bip32_paths)

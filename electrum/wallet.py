@@ -4209,11 +4209,20 @@ class Deterministic_Wallet(Abstract_Wallet):
         if not self.is_mine(address):
             return
         pubkey_deriv_info = self.get_public_keys_with_deriv_info(address)
+        is_taproot = self.get_txin_type(address) == 'p2tr'
         for pubkey in pubkey_deriv_info:
             ks, der_suffix = pubkey_deriv_info[pubkey]
             fp_bytes, der_full = ks.get_fp_and_derivation_to_be_used_in_partial_tx(der_suffix,
                                                                                    only_der_suffix=only_der_suffix)
-            txinout.bip32_paths[pubkey] = (fp_bytes, der_full)
+            if is_taproot:
+                # BIP-371: taproot inputs/outputs carry derivation info as an x-only pubkey in
+                # TAP_BIP32_DERIVATION, not the legacy compressed-pubkey BIP32_DERIVATION field
+                # (see MasterPublicKeyMixin.get_pubkey_derivation's xonly matching, keystore.py).
+                xonly_pubkey = pubkey[1:]
+                txinout.tap_internal_key = xonly_pubkey
+                txinout.tap_bip32_paths[xonly_pubkey] = ((), fp_bytes, der_full)
+            else:
+                txinout.bip32_paths[pubkey] = (fp_bytes, der_full)
 
     def create_new_address(self, for_change: bool = False):
         assert type(for_change) is bool
@@ -4283,19 +4292,22 @@ class Deterministic_Wallet(Abstract_Wallet):
 
     def _learn_derivation_path_for_address_from_txinout(self, txinout, address):
         for ks in self.get_keystores():
-            pubkey, der_suffix = ks.find_my_pubkey_in_txinout(txinout, only_der_suffix=True)
-            if der_suffix is not None:
-                # note: we already know the pubkey belongs to the keystore,
-                #       but the script template might be different
-                if len(der_suffix) != 2:
-                    continue
-                try:
-                    my_address = self.derive_address(*der_suffix)
-                except CannotDerivePubkey:
-                    my_address = None
-                if my_address == address:
-                    self._ephemeral_addr_to_addr_index[address] = list(der_suffix)
-                    return True
+            for pubkey, der_suffix in (
+                ks.find_my_pubkey_in_txinout(txinout, only_der_suffix=True),
+                ks.find_my_taproot_pubkey_in_txinout(txinout, only_der_suffix=True),
+            ):
+                if der_suffix is not None:
+                    # note: we already know the pubkey belongs to the keystore,
+                    #       but the script template might be different
+                    if len(der_suffix) != 2:
+                        continue
+                    try:
+                        my_address = self.derive_address(*der_suffix)
+                    except CannotDerivePubkey:
+                        my_address = None
+                    if my_address == address:
+                        self._ephemeral_addr_to_addr_index[address] = list(der_suffix)
+                        return True
         return False
 
     def get_master_public_keys(self):

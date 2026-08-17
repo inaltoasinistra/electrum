@@ -1577,6 +1577,8 @@ class PSBTInputType(IntEnum):
     FINAL_SCRIPTSIG = 7
     FINAL_SCRIPTWITNESS = 8
     TAP_KEY_SIG = 0x13
+    TAP_BIP32_DERIVATION = 0x16
+    TAP_INTERNAL_KEY = 0x17
     TAP_MERKLE_ROOT = 0x18
     SLIP19_OWNERSHIP_PROOF = 0x19
 
@@ -1585,6 +1587,9 @@ class PSBTOutputType(IntEnum):
     REDEEM_SCRIPT = 0
     WITNESS_SCRIPT = 1
     BIP32_DERIVATION = 2
+    TAP_INTERNAL_KEY = 0x05
+    TAP_TREE = 0x06
+    TAP_BIP32_DERIVATION = 0x07
 
 
 # Serialization/deserialization tools
@@ -1678,6 +1683,8 @@ class PartialTxInput(TxInput, PSBTSection):
         self.bip32_paths = {}  # type: Dict[bytes, Tuple[bytes, Sequence[int]]]  # pubkey -> (xpub_fingerprint, path)
         self.redeem_script = None  # type: Optional[bytes]
         self.witness_script = None  # type: Optional[bytes]
+        self.tap_internal_key = None  # type: Optional[bytes]  # x-only pubkey, taproot key-path internal key
+        self.tap_bip32_paths = {}  # type: Dict[bytes, Tuple[Sequence[bytes], bytes, Sequence[int]]]  # x-only pubkey -> (leaf_hashes, xfp, path)
         self.tap_merkle_root = None  # type: Optional[bytes]
         self.slip_19_ownership_proof = None  # type: Optional[bytes]
         self._unknown = {}  # type: Dict[bytes, bytes]
@@ -1732,9 +1739,13 @@ class PartialTxInput(TxInput, PSBTSection):
             'witness_script': self.witness_script.hex() if self.witness_script else None,
             'sigs_ecdsa': {pubkey.hex(): sig.hex() for pubkey, sig in self.sigs_ecdsa.items()},
             'tap_key_sig': self.tap_key_sig.hex() if self.tap_key_sig else None,
+            'tap_internal_key': self.tap_internal_key.hex() if self.tap_internal_key else None,
             'tap_merkle_root': self.tap_merkle_root.hex() if self.tap_merkle_root else None,
             'bip32_paths': {pubkey.hex(): (xfp.hex(), bip32.convert_bip32_intpath_to_strpath(path))
                             for pubkey, (xfp, path) in self.bip32_paths.items()},
+            'tap_bip32_paths': {pubkey.hex(): ([h.hex() for h in leaf_hashes], xfp.hex(),
+                                                bip32.convert_bip32_intpath_to_strpath(path))
+                                for pubkey, (leaf_hashes, xfp, path) in self.tap_bip32_paths.items()},
             'slip_19_ownership_proof': self.slip_19_ownership_proof.hex() if self.slip_19_ownership_proof else None,
             'unknown_psbt_fields': {key.hex(): val.hex() for key, val in self._unknown.items()},
         })
@@ -1824,6 +1835,19 @@ class PartialTxInput(TxInput, PSBTSection):
                 raise SerializationError(f"value for {repr(kt)} has unexpected length: {len(val)}")
             self.tap_key_sig = val
             if key: raise SerializationError(f"key for {repr(kt)} must be empty")
+        elif kt == PSBTInputType.TAP_INTERNAL_KEY:
+            if self.tap_internal_key is not None:
+                raise SerializationError(f"duplicate key: {repr(kt)}")
+            if len(val) != 32:
+                raise SerializationError(f"value for {repr(kt)} has unexpected length: {len(val)}")
+            self.tap_internal_key = val
+            if key: raise SerializationError(f"key for {repr(kt)} must be empty")
+        elif kt == PSBTInputType.TAP_BIP32_DERIVATION:
+            if key in self.tap_bip32_paths:
+                raise SerializationError(f"duplicate key: {repr(kt)}")
+            if len(key) != 32:
+                raise SerializationError(f"key for {repr(kt)} has unexpected length: {len(key)}")
+            self.tap_bip32_paths[key] = unpack_tap_bip32_deriv(val)
         elif kt == PSBTInputType.TAP_MERKLE_ROOT:
             if self.tap_merkle_root is not None:
                 raise SerializationError(f"duplicate key: {repr(kt)}")
@@ -1884,6 +1908,11 @@ class PartialTxInput(TxInput, PSBTSection):
             wr(PSBTInputType.PARTIAL_SIG, val, pk)
         if self.tap_key_sig is not None:
             wr(PSBTInputType.TAP_KEY_SIG, self.tap_key_sig)
+        if self.tap_internal_key is not None:
+            wr(PSBTInputType.TAP_INTERNAL_KEY, self.tap_internal_key)
+        for k in sorted(self.tap_bip32_paths):
+            leaf_hashes, xfp, path = self.tap_bip32_paths[k]
+            wr(PSBTInputType.TAP_BIP32_DERIVATION, pack_tap_bip32_deriv(leaf_hashes, xfp, path), k)
         if self.tap_merkle_root is not None:
             wr(PSBTInputType.TAP_MERKLE_ROOT, self.tap_merkle_root)
         if self.sighash is not None:
@@ -1961,6 +1990,8 @@ class PartialTxInput(TxInput, PSBTSection):
             #           input key-value map should be cleared from the PSBT"
             self.sigs_ecdsa = {}
             self.tap_key_sig = None
+            self.tap_internal_key = None
+            self.tap_bip32_paths = {}
             self.tap_merkle_root = None
             self.sighash = None
             self.bip32_paths = {}
@@ -1992,6 +2023,9 @@ class PartialTxInput(TxInput, PSBTSection):
                 self.sighash = other_txin.sighash
             if other_txin.tap_key_sig is not None:
                 self.tap_key_sig = other_txin.tap_key_sig
+            if other_txin.tap_internal_key is not None:
+                self.tap_internal_key = other_txin.tap_internal_key
+            self.tap_bip32_paths.update(other_txin.tap_bip32_paths)
             if other_txin.tap_merkle_root is not None:
                 self.tap_merkle_root = other_txin.tap_merkle_root
             self.bip32_paths.update(other_txin.bip32_paths)
@@ -2108,6 +2142,9 @@ class PartialTxOutput(TxOutput, PSBTSection):
         self.redeem_script = None  # type: Optional[bytes]
         self.witness_script = None  # type: Optional[bytes]
         self.bip32_paths = {}  # type: Dict[bytes, Tuple[bytes, Sequence[int]]]  # pubkey -> (xpub_fingerprint, path)
+        self.tap_internal_key = None  # type: Optional[bytes]  # x-only pubkey, taproot key-path internal key
+        self.tap_bip32_paths = {}  # type: Dict[bytes, Tuple[Sequence[bytes], bytes, Sequence[int]]]  # x-only pubkey -> (leaf_hashes, xfp, path)
+        self.tap_tree = None  # type: Optional[bytes]  # opaque taproot script tree; never interpreted (key-path-only support)
         self._unknown = {}  # type: Dict[bytes, bytes]
 
         self._script_descriptor = None  # type: Optional[Descriptor]
@@ -2142,6 +2179,11 @@ class PartialTxOutput(TxOutput, PSBTSection):
             'witness_script': self.witness_script.hex() if self.witness_script else None,
             'bip32_paths': {pubkey.hex(): (xfp.hex(), bip32.convert_bip32_intpath_to_strpath(path))
                             for pubkey, (xfp, path) in self.bip32_paths.items()},
+            'tap_internal_key': self.tap_internal_key.hex() if self.tap_internal_key else None,
+            'tap_bip32_paths': {pubkey.hex(): ([h.hex() for h in leaf_hashes], xfp.hex(),
+                                                bip32.convert_bip32_intpath_to_strpath(path))
+                                for pubkey, (leaf_hashes, xfp, path) in self.tap_bip32_paths.items()},
+            'tap_tree': self.tap_tree.hex() if self.tap_tree else None,
             'unknown_psbt_fields': {key.hex(): val.hex() for key, val in self._unknown.items()},
         })
         return d
@@ -2174,6 +2216,24 @@ class PartialTxOutput(TxOutput, PSBTSection):
             if len(key) not in (33, 65):
                 raise SerializationError(f"key for {repr(kt)} has unexpected length: {len(key)}")
             self.bip32_paths[key] = unpack_bip32_root_fingerprint_and_int_path(val)
+        elif kt == PSBTOutputType.TAP_INTERNAL_KEY:
+            if self.tap_internal_key is not None:
+                raise SerializationError(f"duplicate key: {repr(kt)}")
+            if len(val) != 32:
+                raise SerializationError(f"value for {repr(kt)} has unexpected length: {len(val)}")
+            self.tap_internal_key = val
+            if key: raise SerializationError(f"key for {repr(kt)} must be empty")
+        elif kt == PSBTOutputType.TAP_TREE:
+            if self.tap_tree is not None:
+                raise SerializationError(f"duplicate key: {repr(kt)}")
+            self.tap_tree = val
+            if key: raise SerializationError(f"key for {repr(kt)} must be empty")
+        elif kt == PSBTOutputType.TAP_BIP32_DERIVATION:
+            if key in self.tap_bip32_paths:
+                raise SerializationError(f"duplicate key: {repr(kt)}")
+            if len(key) != 32:
+                raise SerializationError(f"key for {repr(kt)} has unexpected length: {len(key)}")
+            self.tap_bip32_paths[key] = unpack_tap_bip32_deriv(val)
         else:
             full_key = self.get_fullkey_from_keytype_and_key(kt, key)
             if full_key in self._unknown:
@@ -2188,6 +2248,13 @@ class PartialTxOutput(TxOutput, PSBTSection):
         for k in sorted(self.bip32_paths):
             packed_path = pack_bip32_root_fingerprint_and_int_path(*self.bip32_paths[k])
             wr(PSBTOutputType.BIP32_DERIVATION, packed_path, k)
+        if self.tap_internal_key is not None:
+            wr(PSBTOutputType.TAP_INTERNAL_KEY, self.tap_internal_key)
+        if self.tap_tree is not None:
+            wr(PSBTOutputType.TAP_TREE, self.tap_tree)
+        for k in sorted(self.tap_bip32_paths):
+            leaf_hashes, xfp, path = self.tap_bip32_paths[k]
+            wr(PSBTOutputType.TAP_BIP32_DERIVATION, pack_tap_bip32_deriv(leaf_hashes, xfp, path), k)
         for full_key, val in sorted(self._unknown.items()):
             key_type, key = self.get_keytype_and_key_from_fullkey(full_key)
             wr(key_type, val, key=key)
@@ -2201,6 +2268,11 @@ class PartialTxOutput(TxOutput, PSBTSection):
         if other_txout.witness_script is not None:
             self.witness_script = other_txout.witness_script
         self.bip32_paths.update(other_txout.bip32_paths)
+        if other_txout.tap_internal_key is not None:
+            self.tap_internal_key = other_txout.tap_internal_key
+        if other_txout.tap_tree is not None:
+            self.tap_tree = other_txout.tap_tree
+        self.tap_bip32_paths.update(other_txout.tap_bip32_paths)
         self._unknown.update(other_txout._unknown)
 
 
@@ -2637,8 +2709,10 @@ class PartialTransaction(Transaction):
         self.xpubs.clear()
         for txin in self.inputs():
             txin.bip32_paths.clear()
+            txin.tap_bip32_paths.clear()
         for txout in self.outputs():
             txout.bip32_paths.clear()
+            txout.tap_bip32_paths.clear()
 
     def prepare_for_export_for_coinjoin(self) -> None:
         """Removes all sensitive details."""
@@ -2648,11 +2722,14 @@ class PartialTransaction(Transaction):
         # inputs
         for txin in self.inputs():
             txin.bip32_paths.clear()
+            txin.tap_bip32_paths.clear()
         # outputs
         for txout in self.outputs():
             txout.redeem_script = None
             txout.witness_script = None
             txout.bip32_paths.clear()
+            txout.tap_bip32_paths.clear()
+            txout.tap_internal_key = None
             txout._unknown.clear()
 
     async def prepare_for_export_for_hardware_device(self, wallet: 'Abstract_Wallet') -> None:
@@ -2699,3 +2776,29 @@ def unpack_bip32_root_fingerprint_and_int_path(path: bytes) -> Tuple[bytes, Sequ
     xfp = path[0:4]
     int_path = [int.from_bytes(b, byteorder='little', signed=False) for b in chunks(path[4:], 4)]
     return xfp, int_path
+
+
+def pack_leaf_hashes(leaf_hashes: Sequence[bytes]) -> bytes:
+    return bitcoin.var_int(len(leaf_hashes)) + b''.join(leaf_hashes)
+
+
+def unpack_leaf_hashes(f) -> Sequence[bytes]:
+    num = deser_compact_size(f)
+    if num is None:
+        raise SerializationError("unexpected end of stream while reading leaf hash count")
+    hashes = tuple(f.read(32) for _ in range(num))
+    if any(len(h) != 32 for h in hashes):
+        raise SerializationError("bad leaf hash length in TAP_BIP32_DERIVATION")
+    return hashes
+
+
+def pack_tap_bip32_deriv(leaf_hashes: Sequence[bytes], xfp: bytes, path: Sequence[int]) -> bytes:
+    return pack_leaf_hashes(leaf_hashes) + pack_bip32_root_fingerprint_and_int_path(xfp, path)
+
+
+def unpack_tap_bip32_deriv(val: bytes) -> Tuple[Sequence[bytes], bytes, Sequence[int]]:
+    with io.BytesIO(val) as f:
+        leaf_hashes = unpack_leaf_hashes(f)
+        rest = f.read()
+    xfp, path = unpack_bip32_root_fingerprint_and_int_path(rest)
+    return leaf_hashes, xfp, path

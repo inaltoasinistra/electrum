@@ -4063,6 +4063,56 @@ class TestWalletOfflineSigning(ElectrumTestCase):
         self.assertEqual('ee76c0c6da87f0eb5ab4d1ae05d3942512dcd3c4c42518f9d3619e74400cfc1f', tx.txid())
         self.assertEqual('484e350beaa722a744bb3e2aa38de005baa8526d86536d6143e5814355acf775', tx.wtxid())
 
+    async def test_offline_signing_p2tr_beyond_gap_limit(self):
+        # regression test for BIP-371 support: signing a foreign-built taproot PSBT for an
+        # address beyond the offline wallet's gap limit must succeed using the PSBT's own
+        # TAP_BIP32_DERIVATION hint alone (mirrors test_offline_signing_beyond_gap_limit above,
+        # but for a p2tr wallet -- the legacy BIP32_DERIVATION-based gap-limit-bypass mechanism
+        # that test exercises does not apply to taproot inputs).
+        root_seed = keystore.bip39_to_seed(
+            'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+            passphrase='')
+        ks_offline = keystore.bip32_keystore_from_bip43_rootseed(root_seed, derivation="m/86'/1'/0'", script_type='p2tr')
+        wallet_offline = WalletIntegrityHelper.create_standard_wallet(
+            ks_offline,
+            gap_limit=1,  # gap limit of offline wallet intentionally set too low
+            config=self.config,
+        )
+        wallet_online = WalletIntegrityHelper.create_standard_wallet(
+            ks_offline.watching_only_keystore(),
+            gap_limit=4,
+            config=self.config,
+        )
+        self.assertEqual('p2tr', wallet_offline.txin_type)
+        self.assertEqual('p2tr', wallet_online.txin_type)
+
+        # fund an address beyond wallet_offline's gap limit (index 3; gap_limit=1 only covers index 0)
+        recv_addr = wallet_online.get_receiving_addresses()[3]
+        self.assertTrue(recv_addr.startswith('tb1p'))
+        self.assertNotIn(recv_addr, wallet_offline.get_receiving_addresses())
+
+        dummy_txin = PartialTxInput(
+            prevout=TxOutpoint(txid=bytes.fromhex('22' * 32), out_idx=0),
+            script_sig=b'', witness=b'\x00')
+        funding_out = PartialTxOutput.from_address_and_value(recv_addr, 100_000)
+        funding_tx = Transaction(PartialTransaction.from_io([dummy_txin], [funding_out], locktime=0, version=1).serialize())
+        wallet_online.adb.receive_tx_callback(funding_tx, tx_height=TX_HEIGHT_UNCONFIRMED)
+
+        # build the unsigned PSBT online (this is what a foreign PSBT constructor, e.g. Wasabi
+        # or Bitcoin Core, would also produce): exercises the writing side (step 12)
+        outputs = [PartialTxOutput.from_address_and_value(recv_addr, 50_000)]
+        tx = wallet_online.make_unsigned_transaction(outputs=outputs, fee_policy=FixedFeePolicy(1000), tx_version=2, rbf=False)
+        self.assertTrue(tx.inputs()[0].is_taproot())
+        self.assertIsNotNone(tx.inputs()[0].tap_internal_key)
+        self.assertEqual(1, len(tx.inputs()[0].tap_bip32_paths))
+
+        tx_copy = tx_from_any(tx.serialize_as_bytes().hex())  # simulates moving the PSBT to the offline signer
+
+        # sign offline: no rescan, no gap-limit bump -- exercises the reading side (steps 10-11)
+        tx = wallet_offline.sign_transaction(tx_copy, password=None)
+        self.assertTrue(tx.is_complete())
+        self.assertTrue(tx.inputs()[0].is_taproot())
+
     async def test_signing_where_offline_ks_does_not_have_keyorigin_but_psbt_contains_it(self):
         # keystore has intermediate xprv without root fp; tx contains root fp and full path.
         # tx has input with key beyond gap limit

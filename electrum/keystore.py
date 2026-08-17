@@ -122,6 +122,12 @@ class KeyStore(Logger, ABC):
                 # this pubkey already signed
                 continue
             derivation = self.get_pubkey_derivation(pubkey, txin)
+            if not derivation and len(pubkey) == 33:
+                # txin.pubkeys are always 33-byte compressed (Descriptor.get_all_pubkeys()), but
+                # a taproot input's derivation info (BIP-371) is keyed by the 32-byte x-only
+                # encoding of the same key -- retry against tap_bip32_paths before giving up
+                # (mirrors KeyStore.find_my_taproot_pubkey_in_txinout's xonly lookup).
+                derivation = self.get_pubkey_derivation(pubkey[1:], txin, xonly=True)
             if not derivation:
                 continue
             keypairs[pubkey] = derivation
@@ -176,11 +182,14 @@ class KeyStore(Logger, ABC):
     @abstractmethod
     def get_pubkey_derivation(self, pubkey: bytes,
                               txinout: Union['PartialTxInput', 'PartialTxOutput'],
-                              *, only_der_suffix=True) \
+                              *, only_der_suffix=True, xonly=False) \
             -> Union[Sequence[int], str, None]:
         """Returns either a derivation int-list if the pubkey can be HD derived from this keystore,
         the pubkey itself (hex) if the pubkey belongs to the keystore but not HD derived,
         or None if the pubkey is unrelated.
+
+        If xonly is True, pubkey is a 32-byte x-only pubkey and is matched against
+        txinout.tap_bip32_paths instead of txinout.bip32_paths (BIP-371 taproot key-path fields).
         """
         pass
 
@@ -195,6 +204,17 @@ class KeyStore(Logger, ABC):
         # note: we assume that this cosigner only has one pubkey in this txin/txout
         for pubkey in txinout.bip32_paths:
             path = self.get_pubkey_derivation(pubkey, txinout, only_der_suffix=only_der_suffix)
+            if path and not isinstance(path, (str, bytes)):
+                return pubkey, list(path)
+        return None, None
+
+    def find_my_taproot_pubkey_in_txinout(
+            self, txinout: Union['PartialTxInput', 'PartialTxOutput'],
+            *, only_der_suffix: bool = False
+    ) -> Tuple[Optional[bytes], Optional[List[int]]]:
+        # note: we assume that this cosigner only has one pubkey in this txin/txout
+        for pubkey in txinout.tap_bip32_paths:
+            path = self.get_pubkey_derivation(pubkey, txinout, only_der_suffix=only_der_suffix, xonly=True)
             if path and not isinstance(path, (str, bytes)):
                 return pubkey, list(path)
         return None, None
@@ -329,7 +349,9 @@ class Imported_KeyStore(Software_KeyStore):
             raise InvalidPassword()
         return privkey, compressed
 
-    def get_pubkey_derivation(self, pubkey, txin, *, only_der_suffix=True):
+    def get_pubkey_derivation(self, pubkey, txin, *, only_der_suffix=True, xonly=False):
+        if xonly:
+            return None  # imported (non-HD) keys are not p2tr-descriptor wallets in this codebase
         if pubkey.hex() in self.keypairs:
             return pubkey.hex()
         return None
@@ -469,21 +491,29 @@ class MasterPublicKeyMixin(ABC):
             txinout: Union['PartialTxInput', 'PartialTxOutput'],
             *,
             only_der_suffix=True,
+            xonly=False,
     ) -> Union[Sequence[int], str, None]:
         EXPECTED_DER_SUFFIX_LEN = 2
         def test_der_suffix_against_pubkey(der_suffix: Sequence[int], pubkey: bytes) -> bool:
             if len(der_suffix) != EXPECTED_DER_SUFFIX_LEN:
                 return False
             try:
-                if pubkey != self.derive_pubkey(*der_suffix):
+                derived_pubkey = self.derive_pubkey(*der_suffix)
+                if xonly:
+                    derived_pubkey = derived_pubkey[1:]  # strip compressed-pubkey sign byte
+                if pubkey != derived_pubkey:
                     return False
             except CannotDerivePubkey:
                 return False
             return True
 
-        if pubkey not in txinout.bip32_paths:
+        paths = txinout.tap_bip32_paths if xonly else txinout.bip32_paths
+        if pubkey not in paths:
             return None
-        fp_found, path_found = txinout.bip32_paths[pubkey]
+        if xonly:
+            _leaf_hashes, fp_found, path_found = paths[pubkey]
+        else:
+            fp_found, path_found = paths[pubkey]
         der_suffix = None
         full_path = None
         # 1. try fp against our root
