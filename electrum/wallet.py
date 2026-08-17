@@ -4600,8 +4600,8 @@ def restore_wallet_from_text(
         wallet = Imported_Wallet(db, config=config)
         wallet._add_imported_addresses(good_inputs)
     else:
-        if keystore.is_master_key(text):
-            k = keystore.from_master_key(text)
+        if keystore.is_master_key_or_descriptor(text):
+            k = keystore.from_master_key_or_descriptor(text)
         elif keystore.is_seed(text):
             k = keystore.from_seed(text, passphrase=passphrase)
             if k.can_have_deterministic_lightning_xprv():

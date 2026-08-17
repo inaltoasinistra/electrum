@@ -518,6 +518,22 @@ class TestWalletKeystoreAddressIntegrityForMainnet(ElectrumTestCase):
         self.assertEqual(w.get_receiving_addresses()[0], 'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr')
         self.assertEqual(w.get_receiving_addresses()[1], 'bc1p4qhjn9zdvkux4e44uhx8tc55attvtyu358kutcqkudyccelu0was9fqzwh')
 
+    async def test_restore_wallet_from_text_accepts_p2tr_descriptor(self):
+        # restore_wallet_from_text() (the CLI `restore` command's implementation, and any other
+        # headless/offline wallet-creation path) must accept an output descriptor, not just a
+        # bare master key/seed -- otherwise the descriptor-import feature exercised by
+        # test_watch_only_wallet_from_p2tr_descriptor above would only be reachable via the Qt
+        # GUI wizard. Same BIP-86 test vector as that test.
+        descriptor_text = (
+            "tr([73c5da0a/86h/0h/0h]xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)"
+        )
+        wallet = restore_wallet_from_text__for_unittest(
+            descriptor_text, path=None, config=self.config, gap_limit=2)['wallet']
+        self.assertEqual('p2tr', wallet.txin_type)
+        self.assertTrue(wallet.is_watching_only())
+        self.assertEqual('bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr',
+                         wallet.get_receiving_addresses()[0])
+
     async def test_electrum_multisig_seed_standard(self):
         seed_words = 'blast uniform dragon fiscal ensure vast young utility dinosaur abandon rookie sure'
         self.assertEqual(calc_seed_type(seed_words), 'standard')
