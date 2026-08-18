@@ -449,11 +449,31 @@ class WCCreateSeed(WalletWizardComponent):
         self._busy = True
         self.seed_type = 'standard' if self.wizard.config.WIZARD_DONT_CREATE_SEGWIT else 'segwit'
         self.seed_widget = None
+        self.script_type_choice_w = None
         self.seed = None
+        # kept as the single trailing stretch; create_seed() inserts the (re-created) seed widget
+        # before it, so switching the script-type choice doesn't stack extra stretches/widgets
+        self.layout().addStretch(1)
 
     def on_ready(self):
         if self.wizard_data['wallet_type'] == '2fa':
             self.seed_type = '2fa_segwit'
+        elif self.wizard_data['wallet_type'] == 'standard' and not self.wizard.config.WIZARD_DONT_CREATE_SEGWIT:
+            self._add_script_type_choice()
+        QTimer.singleShot(1, self.create_seed)
+
+    def _add_script_type_choice(self):
+        message = _('What address type do you want your new wallet to use?')
+        choices = [
+            ChoiceItem(key='segwit', label=_('Native segwit (p2wpkh)')),
+            ChoiceItem(key='taproot', label=_('Taproot (p2tr)')),
+        ]
+        self.script_type_choice_w = ChoiceWidget(message=message, choices=choices, default_key='segwit')
+        self.script_type_choice_w.itemSelected.connect(self._on_script_type_choice)
+        self.layout().insertWidget(0, self.script_type_choice_w)
+
+    def _on_script_type_choice(self, index):
+        self.seed_type = self.script_type_choice_w.selected_key
         QTimer.singleShot(1, self.create_seed)
 
     def apply(self):
@@ -467,6 +487,10 @@ class WCCreateSeed(WalletWizardComponent):
         self.busy = True
         self.seed = mnemonic.Mnemonic('en').make_seed(seed_type=self.seed_type)
 
+        if self.seed_widget:
+            self.layout().removeWidget(self.seed_widget)
+            self.seed_widget.deleteLater()
+
         self.seed_widget = SeedWidget(
             title=_('Your wallet generation seed is:'),
             seed=self.seed,
@@ -475,8 +499,7 @@ class WCCreateSeed(WalletWizardComponent):
             parent=self,
             config=self.wizard.config,
         )
-        self.layout().addWidget(self.seed_widget)
-        self.layout().addStretch(1)
+        self.layout().insertWidget(self.layout().count() - 1, self.seed_widget)
         self.busy = False
         self.valid = True
 

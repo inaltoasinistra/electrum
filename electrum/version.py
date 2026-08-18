@@ -8,6 +8,7 @@ SEED_PREFIX        = '01'      # Standard wallet
 SEED_PREFIX_SW     = '100'     # Segwit wallet
 SEED_PREFIX_2FA    = '101'     # Two-factor authentication
 SEED_PREFIX_2FA_SW = '102'     # Two-factor auth, using segwit
+SEED_PREFIX_TAPROOT = '103'    # Taproot wallet
 
 
 def seed_prefix(seed_type):
@@ -19,4 +20,6 @@ def seed_prefix(seed_type):
         return SEED_PREFIX_2FA
     elif seed_type == '2fa_segwit':
         return SEED_PREFIX_2FA_SW
+    elif seed_type == 'taproot':
+        return SEED_PREFIX_TAPROOT
     raise Exception(f"unknown seed_type: {seed_type!r}")

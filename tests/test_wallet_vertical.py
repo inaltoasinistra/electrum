@@ -21,7 +21,7 @@ from electrum.util import bfh, NotEnoughFunds, UnrelatedTransactionException, Us
 from electrum.fee_policy import FixedFeePolicy
 from electrum.transaction import (Transaction, PartialTxOutput, tx_from_any, Sighash,
                                    PartialTxInput, TxOutpoint, PartialTransaction)
-from electrum.mnemonic import calc_seed_type
+from electrum.mnemonic import calc_seed_type, Mnemonic
 from electrum.network import Network
 
 from electrum.plugins.trustedcoin import trustedcoin
@@ -187,6 +187,42 @@ class TestWalletKeystoreAddressIntegrityForMainnet(ElectrumTestCase):
 
         self.assertEqual('zprvAaoTFrze53KLvVYL8yL5H4sxoBFto98dgfTxFxcBepBPaEWStxpsdYqvNGxskGMTgX11bUtPiVj3aCe2jXFkAJQMi9RmksGBgFVwFM85Gir',
                          ks.get_lightning_xprv(None))
+
+    async def test_electrum_seed_taproot(self):
+        # taproot electrum seeds have no fixed test vector (the prefix-mining nonce is random), so
+        # mine one fresh here instead of using a hardcoded seed like the other seed-type tests.
+        seed_words = Mnemonic('en').make_seed(seed_type='taproot')
+        self.assertEqual(calc_seed_type(seed_words), 'taproot')
+
+        ks = keystore.from_seed(seed_words, passphrase='', for_multisig=False)
+
+        WalletIntegrityHelper.check_seeded_keystore_sanity(self, ks)
+        self.assertTrue(isinstance(ks, keystore.BIP32_KeyStore))
+        self.assertEqual(ks.script_type, 'p2tr')
+        # unlike segwit electrum seeds, taproot ones fall into the existing non-deterministic
+        # lightning-key fallback (same limitation BIP39 p2tr wallets already have)
+        self.assertFalse(ks.can_have_deterministic_lightning_xprv())
+
+        # script_type must survive a dump()/reload() round-trip, and so must watching_only_keystore()
+        db = WalletDB('', storage=None, upgrade=True)
+        db.put('keystore', ks.dump())
+        reloaded_ks = keystore.load_keystore(db, 'keystore')
+        self.assertEqual('p2tr', reloaded_ks.script_type)
+        self.assertEqual('p2tr', ks.watching_only_keystore().script_type)
+
+        w = WalletIntegrityHelper.create_standard_wallet(ks, config=self.config)
+        self.assertEqual(w.txin_type, 'p2tr')
+        self.assertTrue(w.get_receiving_addresses()[0].startswith('bc1p'))
+        self.assertTrue(w.get_change_addresses()[0].startswith('bc1p'))
+
+    async def test_electrum_seed_taproot_multisig_derivation(self):
+        # keystore.from_seed(for_multisig=True) is implemented for symmetry with the segwit
+        # branch, even though no wizard path currently exposes taproot multisig wallets.
+        seed_words = Mnemonic('en').make_seed(seed_type='taproot')
+
+        ks = keystore.from_seed(seed_words, passphrase='', for_multisig=True)
+        self.assertEqual(ks.script_type, 'p2tr')
+        self.assertEqual(ks.get_derivation_prefix(), "m/1h")
 
     async def test_electrum_seed_old(self):
         seed_words = 'powerful random nobody notice nothing important anyway look away hidden message over'

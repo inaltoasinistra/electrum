@@ -345,7 +345,7 @@ class KeystoreWizard(AbstractWizard):
         # check if seed matches wallet type
         if wallet_type == '2fa' and not is_any_2fa_seed_type(seed_type):
             seed_valid = False
-        elif wallet_type == 'standard' and seed_type not in ['old', 'standard', 'segwit', 'bip39', 'slip39']:
+        elif wallet_type == 'standard' and seed_type not in ['old', 'standard', 'segwit', 'taproot', 'bip39', 'slip39']:
             seed_valid = False
         elif wallet_type == 'multisig' and seed_type not in ['standard', 'segwit', 'bip39', 'slip39']:
             seed_valid = False
@@ -728,7 +728,7 @@ class NewWalletWizard(KeystoreWizard):
                     addresses[addr] = {}
         elif data['keystore_type'] in ['createseed', 'haveseed']:
             seed_extension = data['seed_extra_words'] if data['seed_extend'] else ''
-            if data['seed_type'] in ['old', 'standard', 'segwit']:
+            if data['seed_type'] in ['old', 'standard', 'segwit', 'taproot']:
                 self._logger.debug('creating keystore from electrum seed')
                 k = keystore.from_seed(data['seed'], passphrase=seed_extension, for_multisig=data['wallet_type'] == 'multisig')
             elif data['seed_type'] in ['bip39', 'slip39']:

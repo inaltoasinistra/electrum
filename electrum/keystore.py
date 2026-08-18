@@ -1292,7 +1292,7 @@ def from_seed(seed: str, *, passphrase: Optional[str], for_multisig: bool = Fals
             raise Exception("'old'-type electrum seed cannot have passphrase")
         keystore = Old_KeyStore({})
         keystore.add_seed(seed)
-    elif t in ['standard', 'segwit']:
+    elif t in ['standard', 'segwit', 'taproot']:
         keystore = BIP32_KeyStore({})
         keystore.add_seed(seed)
         keystore.passphrase = passphrase
@@ -1300,10 +1300,20 @@ def from_seed(seed: str, *, passphrase: Optional[str], for_multisig: bool = Fals
         if t == 'standard':
             der = "m/"
             xtype = 'standard'
-        else:
+        elif t == 'segwit':
             der = "m/1'/" if for_multisig else "m/0'/"
             xtype = 'p2wsh' if for_multisig else 'p2wpkh'
+        else:  # t == 'taproot'
+            # taproot has no distinct SLIP132 xpub/xprv header (unlike zpub/ypub), so we reuse the
+            # 'standard' header and flag it via keystore.script_type instead -- same trick used for
+            # BIP39/SLIP39 p2tr in bip32_keystore_from_bip43_rootseed(). Reusing segwit's m/0'//m/1'
+            # singlesig/multisig split is safe: seed-prefix mining makes seed types mutually
+            # exclusive, so a taproot mnemonic can never collide with a segwit one at the same path.
+            der = "m/1'/" if for_multisig else "m/0'/"
+            xtype = 'standard'
         keystore.add_xprv_from_seed(bip32_seed, xtype=xtype, derivation=der)
+        if t == 'taproot':
+            keystore.script_type = 'p2tr'
     else:
         raise BitcoinException('Unexpected seed type {}'.format(repr(t)))
     return keystore

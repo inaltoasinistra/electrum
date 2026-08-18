@@ -306,7 +306,7 @@ class Commands(Logger):
         If you want to be prompted for an argument, type '?' or ':' (concealed)
 
         arg:str:passphrase:Seed extension
-        arg:str:seed_type:The type of wallet to create, e.g. 'standard' or 'segwit'
+        arg:str:seed_type:The type of wallet to create, e.g. 'standard', 'segwit' or 'taproot'
         arg:bool:encrypt_file:Whether the file on disk should be encrypted with the provided password
         """
         d = create_new_wallet(
@@ -466,7 +466,7 @@ class Commands(Logger):
         Create a seed
 
         arg:int:nbits:Number of bits of entropy
-        arg:str:seed_type:The type of seed to create, e.g. 'standard' or 'segwit'
+        arg:str:seed_type:The type of seed to create, e.g. 'standard', 'segwit' or 'taproot'
         arg:str:language:Default language for wordlist
         """
         s = Mnemonic(language).make_seed(seed_type=seed_type, num_bits=nbits)
