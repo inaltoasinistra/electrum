@@ -13,13 +13,14 @@ from electrum import SimpleConfig
 from electrum import util
 from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED, TX_HEIGHT_UNCONF_PARENT, TX_HEIGHT_LOCAL, TX_HEIGHT_FUTURE
 from electrum.wallet import (sweep, Multisig_Wallet, Standard_Wallet, Imported_Wallet,
-                             Abstract_Wallet, CannotBumpFee, BumpFeeStrategy,
+                             Abstract_Wallet, Deterministic_Wallet, CannotBumpFee, BumpFeeStrategy,
                              TransactionPotentiallyDangerousException,
                              TransactionDangerousException,
                              TxSighashRiskLevel, CannotDoubleSpendTx)
 from electrum.util import bfh, NotEnoughFunds, UnrelatedTransactionException, UserFacingException, TxMinedInfo
 from electrum.fee_policy import FixedFeePolicy
-from electrum.transaction import Transaction, PartialTxOutput, tx_from_any, Sighash
+from electrum.transaction import (Transaction, PartialTxOutput, tx_from_any, Sighash,
+                                   PartialTxInput, TxOutpoint, PartialTransaction, TxOutput)
 from electrum.mnemonic import calc_seed_type
 from electrum.network import Network
 
@@ -3641,6 +3642,79 @@ class TestWalletSending(ElectrumTestCase):
             wallet2.sign_transaction(tx2, password=None)
         with self.assertRaises(TransactionDangerousException):
             wallet2.sign_transaction(tx2, password=None, ignore_warnings=True)
+
+    def _make_beyond_gap_limit_input(self, wallet: 'Deterministic_Wallet', *, index: int, value: int = 100_000):
+        """Builds a synthetic PartialTxInput spending from (for_change=0, index) of wallet's own
+        keystore, with witness_utxo/bip32_paths populated exactly as an external PSBT-constructing
+        tool would -- using only the keystore's xpub, no need for the address to be known/derived/
+        funded yet. Mirrors what a beyond-gap-limit PSBT input looks like on import.
+        """
+        ks = wallet.get_keystores()[0]
+        address = wallet.derive_address(0, index)
+        pubkey = ks.derive_pubkey(0, index)
+        fp_bytes, der_full = ks.get_fp_and_derivation_to_be_used_in_partial_tx([0, index], only_der_suffix=False)
+        txin = PartialTxInput(prevout=TxOutpoint(txid=bfh('11' * 32), out_idx=0))
+        txin.witness_utxo = TxOutput.from_address_and_value(address, value)
+        txin.bip32_paths[pubkey] = (fp_bytes, der_full)
+        return address, txin
+
+    async def test_import_tx_beyond_gap_limit_can_be_saved(self):
+        """A tx spending an is-mine input beyond the wallet's gap limit is correctly recognized
+        and displayed as "mine" (via the ephemeral _learn_derivation_path_for_address_from_txinout
+        mechanism, exercised by add_info_from_wallet -- what the Qt/QML tx dialog calls to display
+        an imported PSBT), but must also actually be saveable, not just displayable.
+        """
+        wallet = self.create_standard_wallet_from_seed(
+            'bitter grass shiver impose acquire brush forget axis eager alone wine silver',
+            gap_limit=1,
+        )
+        self.assertEqual(1, wallet.db.num_receiving_addresses())
+
+        target_index = 5  # beyond wallet's gap limit of 1
+        address, txin = self._make_beyond_gap_limit_input(wallet, index=target_index)
+        outputs = [PartialTxOutput.from_address_and_value('tb1qhkyjkuwtwh9fh78dqfvtqvr52q3spvvmzcpw5z', 90_000)]
+        tx = PartialTransaction.from_io([txin], outputs, version=1)
+
+        # simulates the Qt/QML transaction dialog calling add_info_from_wallet() to display the tx
+        tx.add_info_from_wallet(wallet)
+        self.assertTrue(txin.is_mine)  # displayed as ours...
+        self.assertIsNone(wallet.db.get_address_index(address))  # ...but not yet persisted
+
+        # old, buggy path: adb.add_transaction() directly still rejects it as unrelated, even
+        # though add_info_from_wallet() (called above) already recognized/displayed it as ours
+        with self.assertRaises(UnrelatedTransactionException):
+            wallet.adb.add_transaction(copy.deepcopy(tx))
+
+        # the fix: the wallet-level add_transaction() succeeds and persists the address
+        self.assertTrue(wallet.add_transaction(tx))
+        self.assertEqual((0, target_index), tuple(wallet.get_address_index(address)))
+        self.assertEqual(target_index + 1, wallet.db.num_receiving_addresses())
+        self.assertTrue(wallet.is_mine(address))
+
+    async def test_import_tx_beyond_gap_limit_cap_prevents_dos(self):
+        """A PSBT crafted with an absurd derivation index (only the wallet's xpub is needed to
+        construct one -- no private key, no real prevout) must not cause add_transaction() to
+        derive and subscribe an unbounded number of addresses.
+        """
+        wallet = self.create_standard_wallet_from_seed(
+            'bitter grass shiver impose acquire brush forget axis eager alone wine silver',
+            gap_limit=1,
+        )
+        target_index = Deterministic_Wallet.GAP_LIMIT_CATCHUP_MAX_ADDRESSES + 500
+
+        address, txin = self._make_beyond_gap_limit_input(wallet, index=target_index)
+        outputs = [PartialTxOutput.from_address_and_value('tb1qhkyjkuwtwh9fh78dqfvtqvr52q3spvvmzcpw5z', 90_000)]
+        tx = PartialTransaction.from_io([txin], outputs, version=1)
+
+        tx.add_info_from_wallet(wallet)
+        self.assertTrue(txin.is_mine)  # still recognized/displayed as ours...
+
+        # ...but the absurd index exceeds the cap, so nothing gets derived/persisted, and the
+        # unimproved (pre-fix) failure mode remains: still rejected as unrelated
+        with self.assertRaises(UnrelatedTransactionException):
+            wallet.add_transaction(tx)
+        self.assertEqual(1, wallet.db.num_receiving_addresses())
+        self.assertIsNone(wallet.db.get_address_index(address))
 
 
 class TestWalletOfflineSigning(ElectrumTestCase):

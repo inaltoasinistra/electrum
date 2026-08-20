@@ -638,7 +638,7 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
         assert tx
 
         try:
-            if not self.wallet.adb.add_transaction(tx):
+            if not self.wallet.add_transaction(tx):
                 self.saveTxError.emit(tx.txid(), 'conflict',
                             _("Transaction could not be saved.") + "\n" + _("It conflicts with current history."))
                 return False

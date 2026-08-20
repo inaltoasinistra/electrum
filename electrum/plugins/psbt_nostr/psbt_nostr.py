@@ -288,7 +288,7 @@ class CosignerWallet(Logger):  # children have to inherit EventListener and regi
             # 1) don't replace tx with same tx with less signatures
             # 2) we could combine signatures if tx will become more complete
             # 3) ... more heuristics?
-            if not self.wallet.adb.add_transaction(tx):
+            if not self.wallet.add_transaction(tx):
                 # TODO: instead of bool return value, we could use specific fail reason exceptions here
                 raise Exception('transaction was not added')
             if label:

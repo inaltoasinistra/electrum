@@ -2770,6 +2770,28 @@ class Abstract_Wallet(ABC, Logger, EventListener):
         txout.is_change = self.is_change(address)
         self._add_txinout_derivation_info(txout, address, only_der_suffix=only_der_suffix)
 
+    def add_transaction(self, tx: Transaction, *, allow_unrelated: bool = False, is_new: bool = True) -> bool:
+        """Wallet-level entrypoint for saving an externally-sourced (e.g. imported PSBT)
+        transaction. Unlike calling self.adb.add_transaction() directly, this also persists any
+        addresses beyond the gap limit that add_info_from_wallet() recognized as ours via the
+        tx's embedded PSBT derivation metadata -- see _persist_addresses_learned_beyond_gap_limit()
+        -- and re-synchronizes afterwards so the gap-limit invariant (unused trailing addresses)
+        holds again once the tx is reflected in address history. (The re-sync must happen *after*
+        adb.add_transaction(), not as part of the earlier catch-up: synchronize()'s "is the last
+        known address used?" check looks at actual tx history, which doesn't exist yet before
+        adb.add_transaction() runs.)
+        """
+        if isinstance(tx, PartialTransaction):
+            tx.add_info_from_wallet(self)
+            self._persist_addresses_learned_beyond_gap_limit()
+        result = self.adb.add_transaction(tx, allow_unrelated=allow_unrelated, is_new=is_new)
+        if isinstance(tx, PartialTransaction):
+            self.synchronize()
+        return result
+
+    def _persist_addresses_learned_beyond_gap_limit(self) -> None:
+        pass  # implemented by Deterministic_Wallet
+
     def sign_transaction(
             self,
             tx: Transaction,
@@ -4213,6 +4235,45 @@ class Deterministic_Wallet(Abstract_Wallet):
                     self._ephemeral_addr_to_addr_index[address] = list(der_suffix)
                     return True
         return False
+
+    # Hard cap on how many addresses we'll derive+persist (and thus subscribe to the server) in one
+    # Save action, in response to a PSBT's embedded derivation-path metadata. Without this, a PSBT
+    # crafted with an absurd derivation index (only the wallet's xpub is needed to construct one --
+    # no private key, no real prevout) could make a single Save click derive and subscribe to a huge
+    # number of addresses. Gated behind explicit user action (Save), not preview, so a bounded cap
+    # here is safe/cheap.
+    GAP_LIMIT_CATCHUP_MAX_ADDRESSES = 1000
+
+    def _persist_addresses_learned_beyond_gap_limit(self) -> None:
+        """Persists (derives + saves) any addresses that add_input_info()/add_output_info()
+        recognized as ours via a tx's embedded PSBT derivation metadata, but which are beyond the
+        gap limit and so only recorded in self._ephemeral_addr_to_addr_index so far. Called from
+        Abstract_Wallet.add_transaction() -- i.e. only on an explicit user "save this tx" action,
+        never from passive display/preview paths, since persisting subscribes the address with the
+        connected server.
+        """
+        max_index_per_branch: Dict[bool, int] = {}
+        for address, idx in list(self._ephemeral_addr_to_addr_index.items()):
+            if self.db.get_address_index(address) is not None:
+                continue  # already persisted
+            for_change, index = idx
+            for_change = bool(for_change)
+            max_index_per_branch[for_change] = max(max_index_per_branch.get(for_change, -1), index)
+
+        with self.lock:
+            for for_change, target_index in max_index_per_branch.items():
+                num_addr = self.db.num_change_addresses() if for_change else self.db.num_receiving_addresses()
+                num_to_add = target_index - num_addr + 1
+                if num_to_add <= 0:
+                    continue
+                if num_to_add > self.GAP_LIMIT_CATCHUP_MAX_ADDRESSES:
+                    self.logger.warning(
+                        f"not auto-deriving {num_to_add} addresses (for_change={for_change}) to catch "
+                        f"up to a beyond-gap-limit address learned from a tx: exceeds cap of "
+                        f"{self.GAP_LIMIT_CATCHUP_MAX_ADDRESSES}")
+                    continue
+                for _ in range(num_to_add):
+                    self.create_new_address(for_change)
 
     def get_master_public_keys(self):
         return [self.get_master_public_key()]
