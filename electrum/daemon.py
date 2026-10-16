@@ -440,7 +440,7 @@ class Daemon(Logger):
         # Setup commands server
         self.commands_server = None
         if listen_jsonrpc:
-            self.commands_server = CommandsServer(self, fd, only_minimal_jsonrpc=only_minimal_jsonrpc)
+            self.commands_server = CommandsServer(self, fd, only_minimal_jsonrpc=False)  # DIRTY: full RPC with GUI
             asyncio.run_coroutine_threadsafe(self.taskgroup.spawn(self.commands_server.run()), self.asyncio_loop)
 
     @log_exceptions
